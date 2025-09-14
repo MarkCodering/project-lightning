@@ -638,7 +638,8 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
                        enable_qk_prm=False, prm_weight=0.3,
                        rl_top_p: Optional[float] = 0.9,
                        rl_top_k: Optional[int]   = 40,
-                       rl_temperature: float = 0.8):
+                       rl_temperature: float = 0.8,
+                       max_completion_length: int = 256):
     tok = AutoTokenizer.from_pretrained(base_model, use_fast=True, trust_remote_code=True)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
     tok.padding_side = "right"
@@ -707,10 +708,18 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
     print(f"[GRPO] LoRA trainable params (explicit): {lora_trainable:,}")
     print_trainable_params(sft_model)
 
-    # Optional: harmonize generation_config to avoid warnings
+    # Set explicit generation config to avoid warnings and improve completions
     gc = safe_clone_gen_cfg(getattr(sft_model, "generation_config", None))
     gc.cache_implementation = "hybrid"
+    gc.do_sample = True
+    gc.temperature = rl_temperature
+    gc.top_p = rl_top_p  
+    gc.top_k = rl_top_k
+    gc.pad_token_id = tok.eos_token_id
+    gc.eos_token_id = tok.eos_token_id
+    gc.repetition_penalty = 1.05
     sft_model.generation_config = gc
+    print(f"[GRPO] Set explicit generation config: temp={rl_temperature}, top_p={rl_top_p}, cache=hybrid")
 
     # Build GRPO dataset
     math_train = load_math_sft().remove_columns(["target"]).map(lambda ex: {"task":"math"})
@@ -807,6 +816,18 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
                 ))
         return out
 
+    # Explicit generation kwargs to prevent warnings and improve completions
+    generation_kwargs = {
+        "do_sample": True,
+        "temperature": rl_temperature,
+        "top_p": rl_top_p,
+        "top_k": rl_top_k,
+        "pad_token_id": tok.eos_token_id,
+        "eos_token_id": tok.eos_token_id,
+        "repetition_penalty": 1.05,
+        "cache_implementation": "hybrid",
+    }
+
     args = GRPOConfig(
         output_dir=os.path.join(output_dir, "grpo"),
         max_steps=rl_steps,
@@ -818,7 +839,9 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
         num_generations=group_size,
         generation_batch_size=group_size,
         temperature=rl_temperature, top_p=rl_top_p, top_k=rl_top_k,
-        max_prompt_length=max_len, max_completion_length=512,
+        max_prompt_length=max_len, 
+        max_completion_length=max_completion_length,  # Use the parameter
+        generation_kwargs=generation_kwargs,
         gradient_checkpointing=False,  # RL: keep OFF
     )
 
@@ -845,16 +868,18 @@ def main():
     ap.add_argument("--bf16", action="store_true"); ap.add_argument("--no_bf16", dest="bf16", action="store_false")
     ap.set_defaults(bf16=True)
 
-    # Quantum toggles
-    ap.add_argument("--enable_q_bandit", action="store_true")
+    ap.add_argument("--enable_q_bandit", action="store_true", help="Enable Quantum Bandit for reward shaping.")
     ap.add_argument("--bandit_alpha", type=float, default=0.2)
-    ap.add_argument("--enable_qk_prm", action="store_true")
+    ap.add_argument("--enable_qk_prm", dest="enable_qk_prm", action="store_true", help="Enable Quantum Kernel PRM for reward shaping (default: enabled).")
+    ap.add_argument("--disable_qk_prm", dest="enable_qk_prm", action="store_false", help="Disable Quantum Kernel PRM.")
+    ap.set_defaults(enable_qk_prm=True)
     ap.add_argument("--prm_weight", type=float, default=0.3)
 
     # RL sampling
     ap.add_argument("--rl_top_p", type=float, default=0.9)
     ap.add_argument("--rl_top_k", type=int,   default=40)
     ap.add_argument("--rl_temperature", type=float, default=0.8)
+    ap.add_argument("--max_completion_length", type=int, default=256, help="Max completion length for GRPO (shorter = faster, encourages concise answers)")
 
     # Eval sampling & batching
     ap.add_argument("--eval_sample", action="store_true")
@@ -978,7 +1003,8 @@ def main():
             grad_acc=max(1, args.grad_acc//2), group_size=args.group_size, bf16=args.bf16, max_len=args.max_len,
             enable_q_bandit=args.enable_q_bandit, bandit_alpha=args.bandit_alpha,
             enable_qk_prm=args.enable_qk_prm, prm_weight=args.prm_weight,
-            rl_top_p=args.rl_top_p, rl_top_k=args.rl_top_k, rl_temperature=args.rl_temperature
+            rl_top_p=args.rl_top_p, rl_top_k=args.rl_top_k, rl_temperature=args.rl_temperature,
+            max_completion_length=args.max_completion_length
         )
         grpo_trainer.train()
 
