@@ -35,6 +35,7 @@ from transformers.utils import logging as hf_logging
 from peft import LoraConfig, PeftModel, prepare_model_for_kbit_training
 from trl import SFTTrainer, SFTConfig, GRPOTrainer, GRPOConfig
 from tqdm.auto import tqdm
+from transformers.generation.stopping_criteria import StoppingCriteria, StoppingCriteriaList
 
 # --------- clean logs & enable faster matmul ----------
 hf_logging.set_verbosity_warning()
@@ -91,6 +92,54 @@ def parse_final_from_completion(txt: str) -> str:
     if m: return _norm(m.group(1))
     tail = re.findall(r"[-+]?\d*\.?\d+(?:/\d+)?", txt)
     return _norm(tail[-1]) if tail else _norm(txt[-64:])
+
+# ===================== Stopping criteria =====================
+
+class StopOnSubstrings(StoppingCriteria):
+    """Stop generation when any of the provided substrings has just been produced.
+
+    We implement this by tokenizing each substring and checking if the end of any
+    sequence matches the tokenized pattern. This avoids modifying the tokenizer
+    vocabulary and works with LoRA/4-bit models safely.
+    """
+
+    def __init__(self, tokenizer: AutoTokenizer, substrings: list[str]):
+        super().__init__()
+        self.sequences: list[list[int]] = []
+        for s in substrings:
+            try:
+                ids = tokenizer.encode(s, add_special_tokens=False)
+            except Exception:
+                ids = []
+            if ids:
+                self.sequences.append(ids)
+
+    def _endswith_ids(self, row_ids: torch.Tensor, seq_ids: list[int]) -> bool:
+        if row_ids.size(0) < len(seq_ids):
+            return False
+        return torch.equal(row_ids[-len(seq_ids):], torch.tensor(seq_ids, device=row_ids.device))
+
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor, **kwargs) -> bool:
+        if not self.sequences:
+            return False
+        # If ANY batch element ends with ANY stop sequence, stop the whole batch.
+        for seq in self.sequences:
+            for row in input_ids:
+                if self._endswith_ids(row, seq):
+                    return True
+        return False
+
+def build_stop_criteria(tok: AutoTokenizer) -> StoppingCriteriaList:
+    # Works for math (<answer>…</answer>) and code (closing ```), including newline variants.
+    stops = [
+        "</answer>",
+        "\n</answer>",
+        "</answer>\n",
+        "\n\n</answer>",
+        "\n```",
+        "\n\n```",
+    ]
+    return StoppingCriteriaList([StopOnSubstrings(tok, stops)])
 
 # ===================== Prompts =====================
 
@@ -234,6 +283,7 @@ def eval_gsm8k(model, tok, n=100, max_new_tokens=256,
     total = len(questions)
     device = model.device
     gen_cfg = build_gen_cfg(model, do_sample, top_p, top_k, temperature)
+    stop_crit = build_stop_criteria(tok)
 
     correct = 0
     start_t = time.time()
@@ -243,11 +293,12 @@ def eval_gsm8k(model, tok, n=100, max_new_tokens=256,
         batch_final = finals[i:i+batch_size]
         prompts = [p_math(q) for q in batch_q]
         inputs = encode_prompts(tok, prompts, device, max_len_prompt=eval_prompt_max_len)
-        out = model.generate(**inputs, generation_config=gen_cfg, max_new_tokens=max_new_tokens)
+        out = model.generate(**inputs, generation_config=gen_cfg, max_new_tokens=max_new_tokens, stopping_criteria=stop_crit)
         decoded = tok.batch_decode(out, skip_special_tokens=True)
         for j, full in enumerate(decoded):
             pred = parse_final_from_completion(full[len(prompts[j]):])
-            if equal_numeric(pred, batch_final[j]): correct += 1
+            if equal_numeric(pred, batch_final[j]):
+                correct += 1
         done = min(i+batch_size, total)
         elapsed = max(time.time() - start_t, 1e-6)
         pbar.update(len(prompts))
@@ -268,6 +319,7 @@ def eval_mbpp(model, tok, n=50, max_new_tokens=200,
     total = len(descs)
     device = model.device
     gen_cfg = build_gen_cfg(model, do_sample, top_p, top_k, temperature)
+    stop_crit = build_stop_criteria(tok)
 
     passed = 0
     start_t = time.time()
@@ -276,14 +328,15 @@ def eval_mbpp(model, tok, n=50, max_new_tokens=200,
         batch_desc = descs[i:i+batch_size]
         prompts = [p_code(d) for d in batch_desc]
         inputs = encode_prompts(tok, prompts, device, max_len_prompt=eval_prompt_max_len)
-        out = model.generate(**inputs, generation_config=gen_cfg, max_new_tokens=max_new_tokens)
+        out = model.generate(**inputs, generation_config=gen_cfg, max_new_tokens=max_new_tokens, stopping_criteria=stop_crit)
         decoded = tok.batch_decode(out, skip_special_tokens=True)
         for j, full in enumerate(decoded):
             txt = full[len(prompts[j]):]
             m = re.search(r"```(?:python)?\s*(.*?)```", txt, re.S|re.I)
             code = m.group(1) if m else txt
             ok, _ = run_code_and_tests(code, setups[i+j], tests[i+j])
-            if ok: passed += 1
+            if ok:
+                passed += 1
         done = min(i+batch_size, total)
         elapsed = max(time.time() - start_t, 1e-6)
         pbar.update(len(prompts))
@@ -301,6 +354,7 @@ def eval_humaneval(model, tok, n=30, max_new_tokens=200,
     total = len(prompts_raw)
     device = model.device
     gen_cfg = build_gen_cfg(model, do_sample, top_p, top_k, temperature)
+    stop_crit = build_stop_criteria(tok)
 
     passed = 0
     start_t = time.time()
@@ -309,14 +363,15 @@ def eval_humaneval(model, tok, n=30, max_new_tokens=200,
         batch_prompt = prompts_raw[i:i+batch_size]
         prompts = [p_code(p) for p in batch_prompt]
         inputs = encode_prompts(tok, prompts, device, max_len_prompt=eval_prompt_max_len)
-        out = model.generate(**inputs, generation_config=gen_cfg, max_new_tokens=max_new_tokens)
+        out = model.generate(**inputs, generation_config=gen_cfg, max_new_tokens=max_new_tokens, stopping_criteria=stop_crit)
         decoded = tok.batch_decode(out, skip_special_tokens=True)
         for j, full in enumerate(decoded):
             txt = full[len(prompts[j]):]
             m = re.search(r"```(?:python)?\s*(.*?)```", txt, re.S|re.I)
             code = m.group(1) if m else txt
             ok, _ = run_code_and_tests(code, "", [tests_raw[i+j]])
-            if ok: passed += 1
+            if ok:
+                passed += 1
         done = min(i+batch_size, total)
         elapsed = max(time.time() - start_t, 1e-6)
         pbar.update(len(prompts))
@@ -817,6 +872,7 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
         return out
 
     # Explicit generation kwargs to prevent warnings and improve completions
+    stop_crit = build_stop_criteria(tok)
     generation_kwargs = {
         "do_sample": True,
         "temperature": rl_temperature,
@@ -826,6 +882,7 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
         "eos_token_id": tok.eos_token_id,
         "repetition_penalty": 1.05,
         "cache_implementation": "hybrid",
+        "stopping_criteria": stop_crit,
     }
 
     args = GRPOConfig(
