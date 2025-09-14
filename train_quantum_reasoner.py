@@ -188,6 +188,88 @@ def load_math_sft():
     math_all = concatenate_datasets(math_parts) if math_parts else None
     return concatenate_datasets([gsm, math_all]) if math_all is not None else gsm
 
+# ---- Code SFT datasets (optional; HumanEval implies contamination if used) ----
+
+def _first_nonempty_str(d: dict, keys: list[str]) -> Optional[str]:
+    for k in keys:
+        val = d.get(k)
+        if isinstance(val, str) and val.strip():
+            return val
+    return None
+
+def load_mbpp_sft(limit: Optional[int] = None) -> Optional[Dataset]:
+    """Try to build an SFT dataset from MBPP variants that expose reference code.
+
+    We prefer sanitized train/validation splits when available; otherwise we fall back
+    to any split exposing a 'code' field. Returns dataset with columns: prompt, target, source.
+    """
+    tried = [
+        ("google-research-datasets/mbpp", "sanitized"),
+        ("google-research-datasets/mbpp", None),
+        ("evalplus/mbppplus", None),
+        ("Muennighoff/mbpp", None),
+    ]
+    for repo, cfg in tried:
+        try:
+            # Prefer train/validation when present
+            splits = []
+            for split in ["train", "validation", "test"]:
+                try:
+                    ds = load_dataset(repo, cfg, split=split)
+                    splits.append(ds)
+                except Exception:
+                    continue
+            if not splits:
+                continue
+            ds_all = concatenate_datasets(splits) if len(splits) > 1 else splits[0]
+
+            def mapper(ex):
+                desc = _first_nonempty_str(ex, ["text", "prompt", "description", "task_description"]) or ""
+                code = _first_nonempty_str(ex, ["code", "code_string", "code_solution", "solution"]) or ""
+                return {
+                    "source": "mbpp",
+                    "prompt": p_code(desc),
+                    "target": code.strip() if code else None,
+                }
+
+            ds_map = ds_all.map(mapper)
+            # Filter out rows without target code
+            ds_map = ds_map.filter(lambda ex: isinstance(ex.get("target"), str) and len(ex["target"].strip()) > 0)
+            if limit is not None:
+                ds_map = ds_map.select(range(min(limit, len(ds_map))))
+            if len(ds_map) == 0:
+                continue
+            return ds_map
+        except Exception:
+            continue
+    warnings.warn("MBPP SFT could not be constructed (no variant exposing reference code). Skipping.")
+    return None
+
+def load_humaneval_sft(limit: Optional[int] = None) -> Optional[Dataset]:
+    """Build an SFT dataset from HumanEval's canonical solutions.
+
+    NOTE: Training on HumanEval contaminates the standard benchmark. Use only for
+    ablations or when you don't intend to report HumanEval as an unbiased metric.
+    """
+    try:
+        ds = load_dataset("openai/openai_humaneval", split="test")
+        def mapper(ex):
+            desc = _first_nonempty_str(ex, ["prompt"]) or ""
+            code = _first_nonempty_str(ex, ["canonical_solution", "canonical_solution_str", "reference_solution"]) or ""
+            return {"source": "humaneval", "prompt": p_code(desc), "target": code.strip() if code else None}
+        ds_map = ds.map(mapper)
+        ds_map = ds_map.filter(lambda ex: isinstance(ex.get("target"), str) and len(ex["target"].strip()) > 0)
+        if limit is not None:
+            ds_map = ds_map.select(range(min(limit, len(ds_map))))
+        if len(ds_map) == 0:
+            warnings.warn("HumanEval exposes no canonical solutions; skipping SFT for this dataset.")
+            return None
+        warnings.warn("Including HumanEval in SFT: this contaminates the benchmark. Disable with --no_sft_humaneval.")
+        return ds_map
+    except Exception as e:
+        warnings.warn(f"Failed to load HumanEval for SFT: {e}")
+        return None
+
 def _try_load_mbpp_variant() -> Optional[Tuple[str, Optional[str]]]:
     for repo, cfg in [("google-research-datasets/mbpp", None),
                       ("google-research-datasets/mbpp", "sanitized"),
@@ -491,7 +573,11 @@ def _pretokenize_for_sft(raw_ds: Dataset, tok: AutoTokenizer, max_len: int) -> D
     return ds_tok
 
 def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
-                      per_device_train_batch_size=1, grad_acc=8, bf16=True, max_len=4096):
+                      per_device_train_batch_size=1, grad_acc=8, bf16=True, max_len=4096,
+                      sft_include_mbpp: bool = True,
+                      sft_include_humaneval: bool = False,
+                      sft_mbpp_limit: Optional[int] = None,
+                      sft_humaneval_limit: Optional[int] = None):
     tok = AutoTokenizer.from_pretrained(base_model, use_fast=True, trust_remote_code=True)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
     tok.padding_side = "right"
@@ -529,6 +615,21 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
     )
 
     raw = load_math_sft()
+    # Optionally append code SFT datasets
+    if sft_include_mbpp:
+        mbpp_sft = load_mbpp_sft(limit=sft_mbpp_limit)
+        if mbpp_sft is not None and len(mbpp_sft) > 0:
+            raw = concatenate_datasets([raw, mbpp_sft])
+            print(f"[SFT] Added MBPP SFT examples: {len(mbpp_sft):,}")
+        else:
+            print("[SFT] MBPP SFT not available; continuing without it.")
+    if sft_include_humaneval:
+        he_sft = load_humaneval_sft(limit=sft_humaneval_limit)
+        if he_sft is not None and len(he_sft) > 0:
+            raw = concatenate_datasets([raw, he_sft])
+            print(f"[SFT] Added HumanEval SFT examples: {len(he_sft):,}")
+        else:
+            print("[SFT] HumanEval SFT not available; continuing without it.")
     train_ds = _pretokenize_for_sft(raw, tok, max_len=max_len)
     collator = DataCollatorForLanguageModeling(tok, mlm=False)
 
@@ -694,7 +795,11 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
                        rl_top_p: Optional[float] = 0.9,
                        rl_top_k: Optional[int]   = 40,
                        rl_temperature: float = 0.8,
-                       max_completion_length: int = 256):
+                       max_completion_length: int = 256,
+                       rl_include_mbpp: bool = True,
+                       rl_include_humaneval: bool = True,
+                       rl_mbpp_limit: Optional[int] = None,
+                       rl_humaneval_limit: Optional[int] = None):
     tok = AutoTokenizer.from_pretrained(base_model, use_fast=True, trust_remote_code=True)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
     tok.padding_side = "right"
@@ -778,8 +883,16 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
 
     # Build GRPO dataset
     math_train = load_math_sft().remove_columns(["target"]).map(lambda ex: {"task":"math"})
-    mbpp = load_mbpp_test(50)
-    he = load_humaneval_test(30)
+    # Code datasets for RL: full by default (limit can restrict)
+    code_parts = []
+    if rl_include_mbpp:
+        mbpp = load_mbpp_test(None if rl_mbpp_limit in (None, 0) else rl_mbpp_limit)
+        code_parts.append(mbpp)
+        print(f"[GRPO] MBPP RL examples: {len(mbpp):,}")
+    if rl_include_humaneval:
+        he = load_humaneval_test(None if rl_humaneval_limit in (None, 0) else rl_humaneval_limit)
+        code_parts.append(he)
+        print(f"[GRPO] HumanEval RL examples: {len(he):,}")
 
     def map_code_row(ex):
         d = ex.get("text") or ex.get("desc") or ex.get("prompt") or ""
@@ -789,11 +902,11 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
         else:                 tlist = []
         return {"prompt": p_code(d), "task":"code", "test_setup_code": setup, "tests": tlist}
 
-    mbpp_m = mbpp.map(map_code_row, remove_columns=[c for c in mbpp.column_names if c not in []])
-    he_m   = he.map(map_code_row,   remove_columns=[c for c in he.column_names   if c not in []])
-
-    code_train = concatenate_datasets([mbpp_m, he_m]).shuffle(seed=42)
-    mix = concatenate_datasets([math_train, code_train]).shuffle(seed=42)
+    code_mapped = []
+    for part in code_parts:
+        code_mapped.append(part.map(map_code_row, remove_columns=[c for c in part.column_names if c not in []]))
+    code_train = concatenate_datasets(code_mapped).shuffle(seed=42) if code_mapped else None
+    mix = concatenate_datasets([math_train, code_train]).shuffle(seed=42) if code_train is not None else math_train.shuffle(seed=42)
 
     # Optional quantum pieces
     qk_prm = None
@@ -915,6 +1028,15 @@ def main():
     ap.add_argument("--base_model", type=str, default="google/gemma-3-1b-it")
     ap.add_argument("--output_dir", type=str, default="./runs/gemma-3-1b-qrl")
     ap.add_argument("--sft_steps", type=int, default=300)
+    # SFT dataset toggles
+    ap.add_argument("--sft_include_mbpp", action="store_true", help="Include MBPP as SFT (if code solutions available).")
+    ap.add_argument("--no_sft_mbpp", dest="sft_include_mbpp", action="store_false")
+    ap.set_defaults(sft_include_mbpp=True)
+    ap.add_argument("--sft_include_humaneval", action="store_true", help="Include HumanEval in SFT (NOT recommended; contaminates benchmark)")
+    ap.add_argument("--no_sft_humaneval", dest="sft_include_humaneval", action="store_false")
+    ap.set_defaults(sft_include_humaneval=False)
+    ap.add_argument("--sft_mbpp_limit", type=int, default=None)
+    ap.add_argument("--sft_humaneval_limit", type=int, default=None)
     ap.add_argument("--rl_steps", type=int, default=300)
     ap.add_argument("--skip_sft", action="store_true", help="Skip SFT phase and go straight to GRPO using --sft_ckpt")
     ap.add_argument("--sft_ckpt", type=str, default=None, help="Path to existing SFT output dir or specific checkpoint-* directory")
@@ -937,6 +1059,15 @@ def main():
     ap.add_argument("--rl_top_k", type=int,   default=40)
     ap.add_argument("--rl_temperature", type=float, default=0.8)
     ap.add_argument("--max_completion_length", type=int, default=256, help="Max completion length for GRPO (shorter = faster, encourages concise answers)")
+    # RL dataset toggles
+    ap.add_argument("--rl_include_mbpp", action="store_true", help="Include MBPP tasks in RL training.")
+    ap.add_argument("--no_rl_mbpp", dest="rl_include_mbpp", action="store_false")
+    ap.set_defaults(rl_include_mbpp=True)
+    ap.add_argument("--rl_include_humaneval", action="store_true", help="Include HumanEval tasks in RL training (be mindful of contamination).")
+    ap.add_argument("--no_rl_humaneval", dest="rl_include_humaneval", action="store_false")
+    ap.set_defaults(rl_include_humaneval=True)
+    ap.add_argument("--rl_mbpp_limit", type=int, default=None)
+    ap.add_argument("--rl_humaneval_limit", type=int, default=None)
 
     # Eval sampling & batching
     ap.add_argument("--eval_sample", action="store_true")
@@ -1008,7 +1139,11 @@ def main():
     else:
         sft_trainer, tok_sft = build_sft_trainer(
             base_model=args.base_model, output_dir=args.output_dir,
-            sft_steps=args.sft_steps, grad_acc=args.grad_acc, bf16=args.bf16, max_len=args.max_len
+            sft_steps=args.sft_steps, grad_acc=args.grad_acc, bf16=args.bf16, max_len=args.max_len,
+            sft_include_mbpp=args.sft_include_mbpp,
+            sft_include_humaneval=args.sft_include_humaneval,
+            sft_mbpp_limit=args.sft_mbpp_limit,
+            sft_humaneval_limit=args.sft_humaneval_limit,
         )
         sft_trainer.train()
         sft_ckpt = sft_trainer.args.output_dir
@@ -1061,7 +1196,11 @@ def main():
             enable_q_bandit=args.enable_q_bandit, bandit_alpha=args.bandit_alpha,
             enable_qk_prm=args.enable_qk_prm, prm_weight=args.prm_weight,
             rl_top_p=args.rl_top_p, rl_top_k=args.rl_top_k, rl_temperature=args.rl_temperature,
-            max_completion_length=args.max_completion_length
+            max_completion_length=args.max_completion_length,
+            rl_include_mbpp=args.rl_include_mbpp,
+            rl_include_humaneval=args.rl_include_humaneval,
+            rl_mbpp_limit=args.rl_mbpp_limit,
+            rl_humaneval_limit=args.rl_humaneval_limit,
         )
         grpo_trainer.train()
 
