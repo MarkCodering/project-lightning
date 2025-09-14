@@ -1,0 +1,23 @@
+# Core HF stack
+torch>=2.2
+transformers>=4.42
+datasets>=2.19
+trl>=0.9.6
+peft>=0.11.0
+accelerate>=0.30.0
+safetensors>=0.4.2
+pyarrow>=15.0.0
+
+# 4-bit quantization (Linux x86_64 only; safely skipped elsewhere)
+bitsandbytes>=0.43.0; platform_system == "Linux" and platform_machine == "x86_64"
+
+# Quantum (Option A & B)
+pennylane>=0.35.0
+pennylane-lightning>=0.35.0
+
+# Step-embedding model for QK-PRM (recommended; script has a fallback)
+sentence-transformers>=2.2.2
+
+# Scientific
+numpy>=1.24.0
+scipy>=1.10.0

@@ -1,0 +1,1 @@
+python3 train_quantum_reasoner.py --base_model google/gemma-3-4b-it --output_dir ./runs/gemma-3-4b-qrl
