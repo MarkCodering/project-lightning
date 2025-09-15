@@ -1058,7 +1058,7 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
         "eos_token_id": tok.eos_token_id,
         "repetition_penalty": 1.05,
         "cache_implementation": "hybrid",
-        "stopping_criteria": stop_crit,
+        # NOTE: stopping_criteria cannot be part of GenerationConfig; removed to avoid validation error.
     }
 
     args = GRPOConfig(
