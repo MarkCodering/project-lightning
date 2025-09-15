@@ -849,8 +849,7 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
 
     # 3) Load LoRA adapter with is_trainable=True (this sets requires_grad on LoRA)
     latest_checkpoint = None
-    # Allow passing a direct checkpoint path OR a parent directory containing checkpoint-* dirs
-    if os.path.isdir(sft_ckpt):
+    if sft_ckpt and os.path.isdir(sft_ckpt):
         if os.path.basename(sft_ckpt).startswith("checkpoint-"):
             latest_checkpoint = sft_ckpt
         else:
@@ -858,14 +857,57 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
             if checkpoints:
                 latest_checkpoint = max(checkpoints, key=os.path.getctime)
     if latest_checkpoint:
-        sft_model = PeftModel.from_pretrained(
-            base_model_for_rl,
-            latest_checkpoint,
-            is_trainable=True
-        )
-        print(f"[GRPO] Loaded SFT adapter from: {latest_checkpoint}")
+        try:
+            sft_model = PeftModel.from_pretrained(
+                base_model_for_rl,
+                latest_checkpoint,
+                is_trainable=True
+            )
+            print(f"[GRPO] Loaded SFT adapter from: {latest_checkpoint}")
+        except ValueError as e:
+            if "key_mapping" in str(e):
+                print(f"[GRPO][Warn] key_mapping error while loading adapter: {e}\n[GRPO][Recover] Attempting manual LoRA weight load.")
+                # Manual fallback: rebuild LoRA modules then load raw weights (best-effort)
+                import json as _json, os as _os
+                from peft import get_peft_model
+                adapter_cfg_path = _os.path.join(latest_checkpoint, 'adapter_config.json')
+                if not _os.path.isfile(adapter_cfg_path):
+                    raise RuntimeError("Manual adapter recovery failed: adapter_config.json missing") from e
+                with open(adapter_cfg_path) as _f:
+                    _cfg_json = _json.load(_f)
+                # Filter keys valid for LoraConfig
+                valid_keys = {k: _cfg_json[k] for k in list(_cfg_json.keys()) if k in {
+                    'r','lora_alpha','lora_dropout','bias','task_type','target_modules','modules_to_save','init_lora_weights','layers_to_transform','layers_pattern'
+                }}
+                # Ensure target_modules present; if absent, re-detect.
+                if 'target_modules' not in valid_keys or not valid_keys['target_modules']:
+                    valid_keys['target_modules'] = find_lora_targets(base_model_for_rl)
+                lcfg_fallback = LoraConfig(**valid_keys)
+                sft_model = get_peft_model(base_model_for_rl, lcfg_fallback)
+                # Load weights (safetensors preferred)
+                weight_file_st = _os.path.join(latest_checkpoint, 'adapter_model.safetensors')
+                weight_file_bin = _os.path.join(latest_checkpoint, 'adapter_model.bin')
+                state = None
+                if _os.path.isfile(weight_file_st):
+                    try:
+                        from safetensors.torch import load_file as _load_file
+                        state = _load_file(weight_file_st)
+                    except Exception as _se:
+                        print(f"[GRPO][Recover] safetensors load failed ({_se}); trying bin")
+                if state is None:
+                    if _os.path.isfile(weight_file_bin):
+                        state = torch.load(weight_file_bin, map_location='cpu')
+                    else:
+                        raise RuntimeError("No adapter weight file found (adapter_model.safetensors/.bin)") from e
+                missing, unexpected = sft_model.load_state_dict(state, strict=False)
+                print(f"[GRPO][Recover] Manual adapter load complete. missing={len(missing)}, unexpected={len(unexpected)}")
+            else:
+                raise
     else:
-        print(f"[GRPO] No adapter checkpoints found (path: {sft_ckpt}); proceeding with base model only.")
+        if sft_ckpt:
+            print(f"[GRPO] No adapter checkpoints found (path: {sft_ckpt}); proceeding with base model only.")
+        else:
+            print("[GRPO] Starting RL directly from base model (no SFT adapter).")
         sft_model = base_model_for_rl
 
     # Ensure adapter params also consistent
@@ -1165,10 +1207,12 @@ def main():
         print("[Baseline] Skipped baseline evaluation (--skip_baseline_eval flag used)")
 
     if args.skip_sft:
-        if not args.sft_ckpt:
-            raise SystemExit("--skip_sft requires --sft_ckpt to point to an existing SFT directory or checkpoint-*/ path")
-        sft_ckpt = args.sft_ckpt
-        print(f"[Main] Skipping SFT. Using provided checkpoint path: {sft_ckpt}")
+        if args.sft_ckpt:
+            sft_ckpt = args.sft_ckpt
+            print(f"[Main] Skipping SFT. Using provided checkpoint path: {sft_ckpt}")
+        else:
+            sft_ckpt = None  # Signal GRPO builder to use base model only
+            print("[Main] Skipping SFT with no adapter provided; GRPO will start from base model.")
     else:
         sft_trainer, tok_sft = build_sft_trainer(
             base_model=args.base_model, output_dir=args.output_dir,

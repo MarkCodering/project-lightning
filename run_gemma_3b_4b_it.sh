@@ -12,15 +12,13 @@ python train_quantum_reasoner.py \
   --base_model google/gemma-3-4b-it \
   --output_dir ./runs/gemma-3-4b-qrl-v2-qk-prm \
   --skip_baseline_eval \
+  --sft_ckpt ./runs/gemma-3-4b-qrl-v2-qk-prm/sft/checkpoint-300 \
   --enable_qk_prm \
   --rl_steps 300 \
-  --sft_include_mbpp \
-  --sft_mbpp_limit 1000 \
   --rl_include_mbpp \
   --rl_mbpp_limit 500 \
   --flash_attn \
   --compile_models \
-  --disable_sft_gc \
   --use_8bit_optim
 
 echo "Run complete. Outputs in ./runs/gemma-3-4b-qrl-v2-qk-prm"
