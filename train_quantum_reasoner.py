@@ -901,6 +901,13 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
                         raise RuntimeError("No adapter weight file found (adapter_model.safetensors/.bin)") from e
                 missing, unexpected = sft_model.load_state_dict(state, strict=False)
                 print(f"[GRPO][Recover] Manual adapter load complete. missing={len(missing)}, unexpected={len(unexpected)}")
+                # Ensure all LoRA params are trainable
+                lora_trainable = 0
+                for n, p in sft_model.named_parameters():
+                    if "lora_" in n.lower():
+                        p.requires_grad = True
+                        lora_trainable += p.numel()
+                print(f"[GRPO][Recover] Set requires_grad=True for {lora_trainable:,} LoRA params.")
             else:
                 raise
     else:
