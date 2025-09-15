@@ -552,18 +552,19 @@ def _force_bf16(module: nn.Module):
 # ===================== SFT builder =====================
 
 def _pretokenize_for_sft(raw_ds: Dataset, tok: AutoTokenizer, max_len: int) -> Dataset:
+    # Dynamic packing: we stop padding to fixed max_len; truncate if over length.
     def to_text(batch):
         texts = [f"{p}\n\n{t}" for p, t in zip(batch["prompt"], batch["target"])]
         return {"text": texts}
     ds_text = raw_ds.map(to_text, batched=True, remove_columns=[c for c in raw_ds.column_names if c not in []])
-
     tok.model_max_length = max_len
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "right"
 
     def tok_map(batch):
-        enc = tok(batch["text"], truncation=True, max_length=max_len, padding="max_length")
+        enc = tok(batch["text"], truncation=True, max_length=max_len, padding=False)
+        # Collator will dynamically pad. Labels mirror input_ids.
         labels = [ids.copy() for ids in enc["input_ids"]]
         enc["labels"] = labels
         return enc
@@ -577,34 +578,42 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
                       sft_include_mbpp: bool = True,
                       sft_include_humaneval: bool = False,
                       sft_mbpp_limit: Optional[int] = None,
-                      sft_humaneval_limit: Optional[int] = None):
+                      sft_humaneval_limit: Optional[int] = None,
+                      flash_attn: bool = False,
+                      compile_models: bool = False,
+                      disable_sft_gc: bool = False,
+                      use_8bit_optim: bool = False,
+                      dataloader_workers: int = 4):
     tok = AutoTokenizer.from_pretrained(base_model, use_fast=True, trust_remote_code=True)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
     tok.padding_side = "right"
     tok.model_max_length = max_len
 
+    attn_impl = "flash_attention_2" if flash_attn else "eager"
     bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
                              bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         quantization_config=bnb,
         device_map="auto",
         trust_remote_code=True,
-        attn_implementation="eager",
+        attn_implementation=attn_impl,
     )
     _force_bf16(model)
-    model.config.use_cache = False  # SFT: checkpointing + no cache
+    model.config.use_cache = bool(disable_sft_gc)  # keep cache only if not checkpointing
 
     gc = safe_clone_gen_cfg(getattr(model, "generation_config", None))
     gc.do_sample = False; gc.top_p = None; gc.top_k = None; gc.temperature = None
     gc.cache_implementation = "hybrid"
     model.generation_config = gc
 
-    try:
-        model.gradient_checkpointing_enable()
-    except Exception:
-        pass
+    if not disable_sft_gc:
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except Exception:
+            try: model.gradient_checkpointing_enable()
+            except Exception: pass
 
     targets = find_lora_targets(model)
     print(f"[LoRA] target_modules={targets}")
@@ -615,7 +624,6 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
     )
 
     raw = load_math_sft()
-    # Optionally append code SFT datasets
     if sft_include_mbpp:
         mbpp_sft = load_mbpp_sft(limit=sft_mbpp_limit)
         if mbpp_sft is not None and len(mbpp_sft) > 0:
@@ -633,22 +641,35 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
     train_ds = _pretokenize_for_sft(raw, tok, max_len=max_len)
     collator = DataCollatorForLanguageModeling(tok, mlm=False)
 
+    optim_choice = "paged_adamw_8bit" if use_8bit_optim else "adamw_torch"
     args = SFTConfig(
         output_dir=os.path.join(output_dir, "sft"),
         max_steps=sft_steps, learning_rate=lr,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=grad_acc, bf16=bf16,
-        logging_steps=5, logging_first_step=True,
+        logging_steps=20, logging_first_step=True,
         disable_tqdm=False, report_to="none",
         save_steps=200,
         lr_scheduler_type="cosine", warmup_ratio=0.03,
-        gradient_checkpointing=True,
+        gradient_checkpointing=not disable_sft_gc,
+        remove_unused_columns=False,
+        group_by_length=True,
+        optim=optim_choice,
+        dataloader_num_workers=dataloader_workers,
+        dataloader_pin_memory=True,
     )
 
     trainer = SFTTrainer(
         model=model, args=args, train_dataset=train_ds,
         data_collator=collator, peft_config=lora,
     )
+
+    if compile_models:
+        try:
+            trainer.model = torch.compile(trainer.model, mode="reduce-overhead", fullgraph=False)
+            print("[Perf] Compiled model with torch.compile")
+        except Exception as e:
+            print(f"[Perf] torch.compile skipped: {e}")
 
     print_trainable_params(trainer.model)
     return trainer, tok
@@ -799,27 +820,27 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
                        rl_include_mbpp: bool = True,
                        rl_include_humaneval: bool = True,
                        rl_mbpp_limit: Optional[int] = None,
-                       rl_humaneval_limit: Optional[int] = None):
+                       rl_humaneval_limit: Optional[int] = None,
+                       flash_attn: bool = False,
+                       compile_models: bool = False,
+                       use_8bit_optim: bool = False):
     tok = AutoTokenizer.from_pretrained(base_model, use_fast=True, trust_remote_code=True)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
     tok.padding_side = "right"
 
+    attn_impl = "flash_attention_2" if flash_attn else "eager"
     bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
                              bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
-
-    # 1) Load BASE model (eager, cache ON for fast generation)
     base_model_for_rl = AutoModelForCausalLM.from_pretrained(
         base_model,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         quantization_config=bnb,
         device_map="auto",
         trust_remote_code=True,
-        attn_implementation="eager",
+        attn_implementation=attn_impl,
     )
     _force_bf16(base_model_for_rl)
     base_model_for_rl.config.use_cache = True
-
-    # 2) Prepare BASE for 4-bit training (NO gradient checkpointing in RL)
     base_model_for_rl = prepare_model_for_kbit_training(
         base_model_for_rl,
         use_gradient_checkpointing=False
@@ -1004,21 +1025,28 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=grad_acc,
         bf16=bf16,
-        logging_steps=5, logging_first_step=True,
+        logging_steps=20, logging_first_step=True,
         disable_tqdm=False, report_to="none",
         num_generations=group_size,
         generation_batch_size=group_size,
         temperature=rl_temperature, top_p=rl_top_p, top_k=rl_top_k,
         max_prompt_length=max_len, 
-        max_completion_length=max_completion_length,  # Use the parameter
+        max_completion_length=max_completion_length,
         generation_kwargs=generation_kwargs,
-        gradient_checkpointing=False,  # RL: keep OFF
+        gradient_checkpointing=False,
+        remove_unused_columns=False,
+        optim=("paged_adamw_8bit" if use_8bit_optim else "adamw_torch"),
     )
-
     trainer = GRPOTrainer(
         model=sft_model, processing_class=tok, reward_funcs=mixed_reward,
         train_dataset=mix, args=args,
     )
+    if compile_models:
+        try:
+            trainer.model = torch.compile(trainer.model, mode="reduce-overhead", fullgraph=False)
+            print("[Perf] Compiled RL model with torch.compile")
+        except Exception as e:
+            print(f"[Perf] RL torch.compile skipped: {e}")
     return trainer, tok
 
 # ===================== Main =====================
@@ -1068,6 +1096,11 @@ def main():
     ap.set_defaults(rl_include_humaneval=True)
     ap.add_argument("--rl_mbpp_limit", type=int, default=None)
     ap.add_argument("--rl_humaneval_limit", type=int, default=None)
+    # Performance / speed flags
+    ap.add_argument("--flash_attn", action="store_true", help="Use flash attention (requires flash-attn installed)")
+    ap.add_argument("--compile_models", action="store_true", help="Compile models with torch.compile for speed")
+    ap.add_argument("--disable_sft_gc", action="store_true", help="Disable gradient checkpointing during SFT for speed")
+    ap.add_argument("--use_8bit_optim", action="store_true", help="Use paged_adamw_8bit optimizer")
 
     # Eval sampling & batching
     ap.add_argument("--eval_sample", action="store_true")
@@ -1144,6 +1177,10 @@ def main():
             sft_include_humaneval=args.sft_include_humaneval,
             sft_mbpp_limit=args.sft_mbpp_limit,
             sft_humaneval_limit=args.sft_humaneval_limit,
+            flash_attn=args.flash_attn,
+            compile_models=args.compile_models,
+            disable_sft_gc=args.disable_sft_gc,
+            use_8bit_optim=args.use_8bit_optim,
         )
         sft_trainer.train()
         sft_ckpt = sft_trainer.args.output_dir
@@ -1201,6 +1238,9 @@ def main():
             rl_include_humaneval=args.rl_include_humaneval,
             rl_mbpp_limit=args.rl_mbpp_limit,
             rl_humaneval_limit=args.rl_humaneval_limit,
+            flash_attn=args.flash_attn,
+            compile_models=args.compile_models,
+            use_8bit_optim=args.use_8bit_optim,
         )
         grpo_trainer.train()
 

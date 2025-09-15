@@ -21,3 +21,5 @@ sentence-transformers>=2.2.2
 # Scientific
 numpy>=1.24.0
 scipy>=1.10.0
+
+flash-attn --no-build-isolation
