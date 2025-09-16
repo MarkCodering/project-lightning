@@ -59,6 +59,8 @@ COMMON_ARGS=(
   --output_dir "$OUTDIR"
   --sft_steps "$SFT_STEPS"
   --rl_steps "$RL_STEPS"
+  --grad_acc 16
+  --max_len 2048
   --attn "$ATTN_IMPL"
   --eval_top_p "$EVAL_TOP_P"
   --eval_top_k "$EVAL_TOP_K"

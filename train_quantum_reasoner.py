@@ -152,7 +152,8 @@ def load_math_train() -> Dataset:
     gsm = gsm.map(lambda ex: {
         "source": "gsm8k",
         "prompt": p_math(ex["question"]),
-        "target": t_math(ex["answer"], extract_gsm8k_final(ex["answer"])),
+        # Supervise on final answer only to avoid long CoT targets
+        "target": f"<answer>{extract_gsm8k_final(ex['answer'])}</answer>",
         "final": extract_gsm8k_final(ex["answer"]),
     })
     math_parts = []
@@ -162,7 +163,8 @@ def load_math_train() -> Dataset:
             ds = ds.map(lambda ex: {
                 "source": f"math/{cfg}",
                 "prompt": p_math(ex["problem"]),
-                "target": t_math(ex["solution"], extract_math_final(ex["solution"])),
+                # Supervise on final answer only to avoid long CoT targets
+                "target": f"<answer>{extract_math_final(ex['solution'])}</answer>",
                 "final": extract_math_final(ex["solution"]),
             })
             math_parts.append(ds)
@@ -631,6 +633,16 @@ class GradNormOverrideCallback(TrainerCallback):
                 pass
 
 class GradNormCallback(TrainerCallback):
+    def on_before_optimizer_step(self, args, state, control, optimizer=None, **kwargs):
+        model = kwargs.get("model")
+        if model is None:
+            return
+        try:
+            max_gn = getattr(args, 'max_grad_norm', 1.0)
+            if isinstance(max_gn, (int, float)) and max_gn > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_gn)
+        except Exception:
+            pass
     def on_step_end(self, args, state, control, **kwargs):
         model = kwargs.get("model")
         trainer = kwargs.get("trainer")
@@ -650,12 +662,7 @@ class GradNormCallback(TrainerCallback):
                     counted += 1
             gn = (total_sq ** 0.5) if counted > 0 else 0.0
         # Optional: clip gradients to configured max_grad_norm for stability
-        try:
-            max_gn = getattr(args, 'max_grad_norm', 1.0)
-            if isinstance(max_gn, (int, float)) and max_gn > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_gn)
-        except Exception:
-            pass
+        # Clipping is now handled in on_before_optimizer_step
 
         try:
             setattr(model, "_last_grad_norm", float(gn))
@@ -706,33 +713,87 @@ def pretokenize_for_sft(raw_ds: Dataset, tok: "AutoTokenizer", max_len: int) -> 
         tok.pad_token = tok.eos_token
     tok.padding_side = "right"
 
-    def encode_example(ex):
-        p = ex["prompt"]
-        t = ex["target"]
+    use_chat = hasattr(tok, "apply_chat_template")
+
+    def encode_example_chat(ex):
+        p = ex["prompt"]; t = ex["target"]
+        msgs_p = [{"role":"user","content": p}]
+        msgs_full = [{"role":"user","content": p}, {"role":"assistant","content": t}]
+
+        enc_p = tok.apply_chat_template(msgs_p, add_generation_prompt=True, tokenize=True)
+        enc_f = tok.apply_chat_template(msgs_full, add_generation_prompt=False, tokenize=True)
+        p_ids = enc_p["input_ids"] if isinstance(enc_p, dict) else enc_p
+        f_ids = enc_f["input_ids"] if isinstance(enc_f, dict) else enc_f
+        # Flatten if nested (single example sometimes returns [ids])
+        if isinstance(p_ids, list) and len(p_ids) > 0 and isinstance(p_ids[0], list):
+            p_ids = p_ids[0]
+        if isinstance(f_ids, list) and len(f_ids) > 0 and isinstance(f_ids[0], list):
+            f_ids = f_ids[0]
+        # Target portion is the tail after the prompt portion
+        t_ids = f_ids[len(p_ids):]
+
+        # Truncate from the left to fit max_len, preferring to keep target
+        if len(f_ids) > max_len:
+            # number to drop
+            drop = len(f_ids) - max_len
+            f_ids = f_ids[drop:]
+            # Prompt kept length adjusts accordingly
+            kept_p = max(0, len(p_ids) - drop)
+        else:
+            kept_p = len(p_ids)
+        # After truncation, labels are -100 for kept prompt tokens, then actual ids for the rest
+        input_ids = f_ids
+        labels = ([-100] * kept_p) + f_ids[kept_p:]
+        attention_mask = [1] * len(input_ids)
+        return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
+
+    def encode_example_basic(ex):
+        p = ex["prompt"]; t = ex["target"]
         p_ids = tok(p, add_special_tokens=False)["input_ids"]
         t_ids = tok(t, add_special_tokens=False)["input_ids"]
         eos = [tok.eos_token_id] if tok.eos_token_id is not None else []
-
-        # Ensure target fits; prioritize keeping target tokens
-        max_target = max_len - 1 if eos else max_len
+        max_target = max_len - len(eos)
         if len(t_ids) > max_target:
             t_ids = t_ids[:max_target]
-        # Remaining for prompt after reserving target + eos
         remain = max_len - len(t_ids) - len(eos)
         if remain < 0:
             remain = 0
         if len(p_ids) > remain:
-            # Keep the last tokens of prompt to preserve task end context
             p_ids = p_ids[-remain:] if remain > 0 else []
-
         input_ids = p_ids + t_ids + eos
         labels = ([-100] * len(p_ids)) + t_ids + eos
         attention_mask = [1] * len(input_ids)
         return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
 
-    ds_tok = raw_ds.map(encode_example, remove_columns=[c for c in raw_ds.column_names if c not in ["prompt","target"]])
+    mapper = encode_example_chat if use_chat else encode_example_basic
+    ds_tok = raw_ds.map(mapper, remove_columns=list(raw_ds.column_names))
     ds_tok.set_format(type="torch")
     return ds_tok
+
+class DataCollatorKeepLabels:
+    def __init__(self, tokenizer: AutoTokenizer, label_pad_token_id: int = -100):
+        self.tok = tokenizer
+        self.label_pad_token_id = label_pad_token_id
+
+    def __call__(self, features: List[dict]) -> dict:
+        # Ensure lists for pad()
+        def tolist(x):
+            if isinstance(x, torch.Tensor):
+                return x.tolist()
+            return x
+        batch_inputs = {
+            "input_ids": [tolist(f["input_ids"]) for f in features],
+            "attention_mask": [tolist(f["attention_mask"]) for f in features],
+        }
+        batch = self.tok.pad(batch_inputs, padding=True, return_tensors="pt")
+        max_len = batch["input_ids"].size(1)
+        labels = torch.full((len(features), max_len), self.label_pad_token_id, dtype=torch.long)
+        for i, f in enumerate(features):
+            li = tolist(f["labels"]) if "labels" in f else tolist(f["input_ids"])  # fallback
+            L = min(len(li), max_len)
+            labels[i, :L] = torch.tensor(li[:L], dtype=torch.long)
+        batch["labels"] = labels
+        return batch
 
 def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
                       per_device_train_batch_size=1, grad_acc=8, bf16=True, max_len=4096,
@@ -810,14 +871,15 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
             print("[SFT] MBPP train/val not available; continuing without it.")
 
     train_ds = pretokenize_for_sft(raw, tok, max_len=max_len)
-    collator = DataCollatorForLanguageModeling(tok, mlm=False)
+    # Use a collator that preserves provided masked labels
+    collator = DataCollatorKeepLabels(tok, label_pad_token_id=-100)
     optim_choice = "paged_adamw_8bit" if use_8bit_optim else "adamw_torch"
 
     args = SFTConfig(
         output_dir=os.path.join(output_dir, "sft"),
         max_steps=sft_steps,
-        learning_rate=min(lr, 1.5e-5),             # reduce LR a bit for stability
-        warmup_steps=max(20, int(0.03 * sft_steps)),  # more warmup for stability
+        learning_rate=min(lr, 3.0e-6),             # tighter LR cap for stability
+        warmup_steps=max(100, int(0.20 * sft_steps)),  # 20% warmup or at least 100 steps
         warmup_ratio=0.0,                          # disable ratio-based warmup
         lr_scheduler_type="cosine",
         per_device_train_batch_size=per_device_train_batch_size,
@@ -834,8 +896,10 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
         optim=optim_choice,
         dataloader_num_workers=dataloader_workers,
         dataloader_pin_memory=True,
-        max_grad_norm=1.0,                         # clip for stability
-        weight_decay=0.01,                         # regularization to stabilize loss
+        max_grad_norm=0.2,                         # even tighter clip
+        weight_decay=0.0,                          # disable weight decay for LoRA
+        adam_beta1=0.9,
+        adam_beta2=0.95,
     )
 
     trainer = SFTTrainer(
