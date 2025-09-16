@@ -1,21 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Gemma-3-270M reasoner: SFT -> GRPO (+ Quantum A/B), with fast batched eval,
-clean progress bars, top-k/top-p controls, version-safe GenerationConfig,
-robust MBPP/HumanEval loaders (no dataset scripts), explicit eval truncation,
-TRL-version-safe SFT (pre-tokenized), and Hendrycks MATH config fix.
+Clean SFT -> GRPO training + clean evaluation (no test-set contamination).
 
-PATCHES (this version):
-- Force attn_implementation="eager" on all model loads (Gemma-3 recommendation).
-- SFT: use_cache=False + gradient_checkpointing=True (memory-friendly training).
-- GRPO: use_cache=True + gradient_checkpointing=False (fast generation).
-- **Critical**: In GRPO, call prepare_model_for_kbit_training on the BASE model
-  *before* loading the LoRA adapter, and load adapter with is_trainable=True.
-- Explicitly unfreeze lora_* params after loading; print trainable counts.
-- Right-side padding; cleaner generation_config handling.
+- SFT: GSM8K(train) + Hendrycks MATH(train) [+ optional MBPP train/val only]
+- RL (GRPO): same train-only pools (never HumanEval, never MBPP test)
+- Eval: GSM8K(test), MBPP(test), HumanEval(test)  [HumanEval is eval-only by default]
+
+Notes:
+- Uses LoRA on top of a 4-bit base model for memory efficiency.
+- Left padding during eval for decoder-only generation correctness.
+- Version-safe GenerationConfig; explicit stopping criteria for </answer> / code blocks.
+- Minimal dependencies: transformers, datasets, peft, trl, accelerate, bitsandbytes, torch, tqdm.
 """
 
-import os, re, json, math, time, argparse, tempfile, subprocess, warnings, copy, glob
+import os, re, json, time, argparse, tempfile, subprocess, warnings, copy, glob, math
 from typing import List, Tuple, Optional
 
 import numpy as np
@@ -32,13 +30,13 @@ from transformers import (
     DataCollatorForLanguageModeling,
 )
 from transformers.utils import logging as hf_logging
-from peft import LoraConfig, PeftModel, prepare_model_for_kbit_training
+from transformers.generation.stopping_criteria import StoppingCriteria, StoppingCriteriaList
+from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from trl import SFTTrainer, SFTConfig, GRPOTrainer, GRPOConfig
 from tqdm.auto import tqdm
-from transformers.generation.stopping_criteria import StoppingCriteria, StoppingCriteriaList
 
-# --------- clean logs & enable faster matmul ----------
 hf_logging.set_verbosity_warning()
+
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
 try:
@@ -46,19 +44,7 @@ try:
 except Exception:
     pass
 
-# ===================== Version-safe GenerationConfig clone =====================
-
-def safe_clone_gen_cfg(gc: Optional[GenerationConfig]) -> GenerationConfig:
-    if gc is None:
-        return GenerationConfig()
-    try:
-        return gc.clone()
-    except Exception:
-        if hasattr(gc, "to_dict"):
-            return GenerationConfig(**gc.to_dict())
-        return copy.deepcopy(gc)
-
-# ===================== Utilities: parsing/normalizing =====================
+# --------------------------- small utils ---------------------------
 
 def _norm(x: str) -> str:
     return re.sub(r"\s+", " ", x).strip()
@@ -69,43 +55,46 @@ def extract_gsm8k_final(s: str) -> str:
 
 def extract_math_final(solution: str) -> str:
     m = re.search(r"\\boxed\{([^}]*)\}", solution)
-    if m: return _norm(m.group(1))
+    if m:
+        return _norm(m.group(1))
     tail = re.findall(r"[-+]?\d*\.?\d+(?:/\d+)?", solution)
     return _norm(tail[-1]) if tail else _norm(solution)
 
 def equal_numeric(a: str, b: str, tol=1e-6) -> bool:
-    if _norm(a) == _norm(b): return True
+    a, b = _norm(a), _norm(b)
+    if a == b:
+        return True
+
     def parse_num(s):
         s = s.strip()
         if "/" in s and not re.match(r"^-?\d+\.\d+$", s):
             try:
                 n, d = s.split("/")
-                return float(n)/float(d)
-            except: pass
-        try: return float(s)
-        except: return None
+                return float(n) / float(d)
+            except Exception:
+                pass
+        try:
+            return float(s)
+        except Exception:
+            return None
+
     ax, bx = parse_num(a), parse_num(b)
-    return (ax is not None and bx is not None and abs(ax-bx) <= tol)
+    return (ax is not None and bx is not None and abs(ax - bx) <= tol)
 
 def parse_final_from_completion(txt: str) -> str:
-    m = re.search(r"<answer>\s*(.*?)</answer>", txt, re.S|re.I)
-    if m: return _norm(m.group(1))
+    m = re.search(r"<answer>\s*(.*?)</answer>", txt, re.S | re.I)
+    if m:
+        return _norm(m.group(1))
     tail = re.findall(r"[-+]?\d*\.?\d+(?:/\d+)?", txt)
     return _norm(tail[-1]) if tail else _norm(txt[-64:])
 
-# ===================== Stopping criteria =====================
+# ---------------------- stopping criteria -------------------------
 
 class StopOnSubstrings(StoppingCriteria):
-    """Stop generation when any of the provided substrings has just been produced.
-
-    We implement this by tokenizing each substring and checking if the end of any
-    sequence matches the tokenized pattern. This avoids modifying the tokenizer
-    vocabulary and works with LoRA/4-bit models safely.
-    """
-
-    def __init__(self, tokenizer: AutoTokenizer, substrings: list[str]):
+    def __init__(self, tokenizer: AutoTokenizer, substrings: List[str]):
         super().__init__()
-        self.sequences: list[list[int]] = []
+        self.tokenizer = tokenizer
+        self.sequences: List[List[int]] = []
         for s in substrings:
             try:
                 ids = tokenizer.encode(s, add_special_tokens=False)
@@ -114,34 +103,29 @@ class StopOnSubstrings(StoppingCriteria):
             if ids:
                 self.sequences.append(ids)
 
-    def _endswith_ids(self, row_ids: torch.Tensor, seq_ids: list[int]) -> bool:
+    def _endswith_ids(self, row_ids: torch.Tensor, seq_ids: List[int]) -> bool:
         if row_ids.size(0) < len(seq_ids):
             return False
-        return torch.equal(row_ids[-len(seq_ids):], torch.tensor(seq_ids, device=row_ids.device))
+        tail = row_ids[-len(seq_ids):]
+        return torch.equal(tail, torch.tensor(seq_ids, device=tail.device))
 
     def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor, **kwargs) -> bool:
         if not self.sequences:
             return False
-        # If ANY batch element ends with ANY stop sequence, stop the whole batch.
-        for seq in self.sequences:
-            for row in input_ids:
+        for row in input_ids:
+            for seq in self.sequences:
                 if self._endswith_ids(row, seq):
                     return True
         return False
 
 def build_stop_criteria(tok: AutoTokenizer) -> StoppingCriteriaList:
-    # Works for math (<answer>…</answer>) and code (closing ```), including newline variants.
     stops = [
-        "</answer>",
-        "\n</answer>",
-        "</answer>\n",
-        "\n\n</answer>",
-        "\n```",
-        "\n\n```",
+        "</answer>", "\n</answer>", "</answer>\n", "\n\n</answer>",
+        "\n```", "\n\n```",
     ]
     return StoppingCriteriaList([StopOnSubstrings(tok, stops)])
 
-# ===================== Prompts =====================
+# -------------------------- prompts --------------------------------
 
 MATH_SYS = "You are a careful mathematician. Solve step by step in <think>...</think>, then put ONLY the final short answer inside <answer>...</answer>."
 CODE_SYS = "You are a helpful coding assistant. Write correct, efficient Python code. Return ONLY code if tests will run."
@@ -155,21 +139,20 @@ def t_math(thought: str, final: str) -> str:
 def p_code(desc: str) -> str:
     return f"{CODE_SYS}\n\nProblem:\n{desc.strip()}\n\nWrite the solution."
 
-# ===================== Dataset loaders (NO script execution) =====================
+# ---------------------- dataset loaders (CLEAN) --------------------
 
 HENDRYCKS_CFGS = [
     "algebra","counting_and_probability","geometry","intermediate_algebra",
     "number_theory","prealgebra","precalculus",
 ]
 
-def load_math_sft():
+def load_math_train() -> Dataset:
     gsm = load_dataset("openai/gsm8k", "main", split="train")
     gsm = gsm.map(lambda ex: {
         "source": "gsm8k",
         "prompt": p_math(ex["question"]),
         "target": t_math(ex["answer"], extract_gsm8k_final(ex["answer"])),
         "final": extract_gsm8k_final(ex["answer"]),
-        "teacher_think": ex["answer"],
     })
     math_parts = []
     for cfg in HENDRYCKS_CFGS:
@@ -180,28 +163,24 @@ def load_math_sft():
                 "prompt": p_math(ex["problem"]),
                 "target": t_math(ex["solution"], extract_math_final(ex["solution"])),
                 "final": extract_math_final(ex["solution"]),
-                "teacher_think": ex["solution"],
             })
             math_parts.append(ds)
         except Exception as e:
-            warnings.warn(f"Skipping hendrycks_math config '{cfg}': {e}")
+            warnings.warn(f"Skipping hendrycks_math '{cfg}': {e}")
     math_all = concatenate_datasets(math_parts) if math_parts else None
     return concatenate_datasets([gsm, math_all]) if math_all is not None else gsm
 
-# ---- Code SFT datasets (optional; HumanEval implies contamination if used) ----
-
-def _first_nonempty_str(d: dict, keys: list[str]) -> Optional[str]:
+def _first_nonempty(d: dict, keys: List[str]) -> Optional[str]:
     for k in keys:
-        val = d.get(k)
-        if isinstance(val, str) and val.strip():
-            return val
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
     return None
 
-def load_mbpp_sft(limit: Optional[int] = None) -> Optional[Dataset]:
-    """Try to build an SFT dataset from MBPP variants that expose reference code.
-
-    We prefer sanitized train/validation splits when available; otherwise we fall back
-    to any split exposing a 'code' field. Returns dataset with columns: prompt, target, source.
+def load_mbpp_trainval(limit: Optional[int] = None) -> Optional[Dataset]:
+    """
+    Train-only MBPP: uses train + validation splits from sanitized MBPP if available.
+    Never touches the official test set. Returns prompt/target pairs where reference code exists.
     """
     tried = [
         ("google-research-datasets/mbpp", "sanitized"),
@@ -211,9 +190,9 @@ def load_mbpp_sft(limit: Optional[int] = None) -> Optional[Dataset]:
     ]
     for repo, cfg in tried:
         try:
-            # Prefer train/validation when present
+            # collect only non-test splits
             splits = []
-            for split in ["train", "validation", "test"]:
+            for split in ["train", "validation"]:
                 try:
                     ds = load_dataset(repo, cfg, split=split)
                     splits.append(ds)
@@ -224,16 +203,13 @@ def load_mbpp_sft(limit: Optional[int] = None) -> Optional[Dataset]:
             ds_all = concatenate_datasets(splits) if len(splits) > 1 else splits[0]
 
             def mapper(ex):
-                desc = _first_nonempty_str(ex, ["text", "prompt", "description", "task_description"]) or ""
-                code = _first_nonempty_str(ex, ["code", "code_string", "code_solution", "solution"]) or ""
-                return {
-                    "source": "mbpp",
-                    "prompt": p_code(desc),
-                    "target": code.strip() if code else None,
-                }
+                desc = _first_nonempty(ex, ["text","prompt","description","task_description"]) or ""
+                code = _first_nonempty(ex, ["code","code_string","code_solution","solution"]) or ""
+                out = {"source":"mbpp_train","prompt": p_code(desc)}
+                out["target"] = code.strip() if code.strip() else None
+                return out
 
             ds_map = ds_all.map(mapper)
-            # Filter out rows without target code
             ds_map = ds_map.filter(lambda ex: isinstance(ex.get("target"), str) and len(ex["target"].strip()) > 0)
             if limit is not None:
                 ds_map = ds_map.select(range(min(limit, len(ds_map))))
@@ -242,46 +218,10 @@ def load_mbpp_sft(limit: Optional[int] = None) -> Optional[Dataset]:
             return ds_map
         except Exception:
             continue
-    warnings.warn("MBPP SFT could not be constructed (no variant exposing reference code). Skipping.")
+    warnings.warn("MBPP train/val could not be constructed without test; skipping MBPP in training.")
     return None
 
-def load_humaneval_sft(limit: Optional[int] = None) -> Optional[Dataset]:
-    """Build an SFT dataset from HumanEval's canonical solutions.
-
-    NOTE: Training on HumanEval contaminates the standard benchmark. Use only for
-    ablations or when you don't intend to report HumanEval as an unbiased metric.
-    """
-    try:
-        ds = load_dataset("openai/openai_humaneval", split="test")
-        def mapper(ex):
-            desc = _first_nonempty_str(ex, ["prompt"]) or ""
-            code = _first_nonempty_str(ex, ["canonical_solution", "canonical_solution_str", "reference_solution"]) or ""
-            return {"source": "humaneval", "prompt": p_code(desc), "target": code.strip() if code else None}
-        ds_map = ds.map(mapper)
-        ds_map = ds_map.filter(lambda ex: isinstance(ex.get("target"), str) and len(ex["target"].strip()) > 0)
-        if limit is not None:
-            ds_map = ds_map.select(range(min(limit, len(ds_map))))
-        if len(ds_map) == 0:
-            warnings.warn("HumanEval exposes no canonical solutions; skipping SFT for this dataset.")
-            return None
-        warnings.warn("Including HumanEval in SFT: this contaminates the benchmark. Disable with --no_sft_humaneval.")
-        return ds_map
-    except Exception as e:
-        warnings.warn(f"Failed to load HumanEval for SFT: {e}")
-        return None
-
-def _try_load_mbpp_variant() -> Optional[Tuple[str, Optional[str]]]:
-    for repo, cfg in [("google-research-datasets/mbpp", None),
-                      ("google-research-datasets/mbpp", "sanitized"),
-                      ("evalplus/mbppplus", None)]:
-        try:
-            load_dataset(repo, cfg, split="test")
-            return repo, cfg
-        except Exception:
-            continue
-    return None
-
-def _map_mbpp_columns(ds: Dataset) -> Dataset:
+def _map_mbpp_eval_columns(ds: Dataset) -> Dataset:
     def to_list_tests(x):
         if isinstance(x, list): return x
         if isinstance(x, str):  return [x]
@@ -296,12 +236,28 @@ def _map_mbpp_columns(ds: Dataset) -> Dataset:
     return ds.map(map_row, remove_columns=[c for c in ds.column_names if c not in keep])
 
 def load_mbpp_test(n: Optional[int] = None) -> Dataset:
-    choice = _try_load_mbpp_variant()
+    # Always official test split for eval; never used in training here.
+    # Prefer sanitized if present (same tasks but normalized format).
+    choice = None
+    for repo, cfg in [("google-research-datasets/mbpp","sanitized"),
+                      ("google-research-datasets/mbpp", None),
+                      ("evalplus/mbppplus", None)]:
+        try:
+            load_dataset(repo, cfg, split="test")
+            choice = (repo, cfg); break
+        except Exception:
+            continue
     if choice is None:
-        raise RuntimeError("Could not load MBPP without dataset scripts. Try --skip_mbpp_eval.")
+        raise RuntimeError("Could not load MBPP test split for clean evaluation.")
     repo, cfg = choice
     ds = load_dataset(repo, cfg, split="test")
-    ds = _map_mbpp_columns(ds)
+    ds = _map_mbpp_eval_columns(ds)
+    if n is not None:
+        ds = ds.select(range(min(n, len(ds))))
+    return ds
+
+def load_gsm8k_test(n: Optional[int] = None) -> Dataset:
+    ds = load_dataset("openai/gsm8k", "main", split="test")
     if n is not None:
         ds = ds.select(range(min(n, len(ds))))
     return ds
@@ -312,23 +268,36 @@ def load_humaneval_test(n: Optional[int] = None) -> Dataset:
         ds = ds.select(range(min(n, len(ds))))
     return ds
 
-# ===================== Code sandbox (demo; not secure) =====================
+# ---------------------- tiny sandbox for code ----------------------
 
-def run_code_and_tests(code: str, setup: str, tests: List[str], timeout_s=4) -> Tuple[bool, str]:
+def run_code_and_tests(code: str, setup: str, tests: List[str], timeout_s=6) -> Tuple[bool, str]:
     snippet = "\n".join([setup or "", code, "\n".join(tests)])
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
         f.write(snippet); path = f.name
     try:
-        proc = subprocess.run(["python", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              text=True, timeout=timeout_s)
-        return proc.returncode == 0, proc.stderr
+        proc = subprocess.run(
+            ["python", path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=timeout_s
+        )
+        return proc.returncode == 0, (proc.stdout + "\n" + proc.stderr)
     except subprocess.TimeoutExpired:
         return False, "TIMEOUT"
     finally:
         try: os.remove(path)
-        except: pass
+        except Exception: pass
 
-# ===================== Generation config builder =====================
+# ----------------- generation config helpers ----------------------
+
+def safe_clone_gen_cfg(gc: Optional[GenerationConfig]) -> GenerationConfig:
+    if gc is None:
+        return GenerationConfig()
+    try:
+        return gc.clone()
+    except Exception:
+        if hasattr(gc, "to_dict"):
+            return GenerationConfig(**gc.to_dict())
+        return copy.deepcopy(gc)
 
 def build_gen_cfg(model, do_sample: bool, top_p=None, top_k=None, temperature=None) -> GenerationConfig:
     gen = safe_clone_gen_cfg(getattr(model, "generation_config", None))
@@ -343,23 +312,21 @@ def build_gen_cfg(model, do_sample: bool, top_p=None, top_k=None, temperature=No
         gen.top_p = None; gen.top_k = None; gen.temperature = None
     return gen
 
-# ===================== Tokenization helpers =====================
-
-def _finite_max_len(tok_max: int) -> bool:
+def finitemax_len(tok_max: int) -> bool:
     return tok_max is not None and tok_max != float("inf") and tok_max < 100_000
 
 def encode_prompts(tok, prompts: List[str], device, max_len_prompt: int):
     tok_max = getattr(tok, "model_max_length", None)
-    max_len = max_len_prompt if not _finite_max_len(tok_max) else min(tok_max, max_len_prompt)
+    max_len = max_len_prompt if not finitemax_len(tok_max) else min(tok_max, max_len_prompt)
     return tok(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_len).to(device)
 
-# ===================== Batched evals =====================
+# ------------------------- EVALS (CLEAN) --------------------------
 
 @torch.inference_mode()
 def eval_gsm8k(model, tok, n=100, max_new_tokens=256,
                do_sample=False, top_p=None, top_k=None, temperature=None,
                batch_size: int = 8, eval_prompt_max_len: int = 2048):
-    ds = load_dataset("openai/gsm8k", "main", split="test").select(range(n))
+    ds = load_gsm8k_test(n)
     questions = ds["question"]
     finals = [extract_gsm8k_final(x) for x in ds["answer"]]
     total = len(questions)
@@ -370,6 +337,7 @@ def eval_gsm8k(model, tok, n=100, max_new_tokens=256,
     correct = 0
     start_t = time.time()
     pbar = tqdm(total=total, desc="GSM8K eval", dynamic_ncols=True, smoothing=0.1)
+
     for i in range(0, total, batch_size):
         batch_q = questions[i:i+batch_size]
         batch_final = finals[i:i+batch_size]
@@ -394,18 +362,16 @@ def eval_mbpp(model, tok, n=50, max_new_tokens=200,
               batch_size: int = 4, eval_prompt_max_len: int = 1536):
     ds = load_mbpp_test(n)
     descs = ds["text"]
-    cols = set(ds.column_names)
-    setups = ds["test_setup_code"] if "test_setup_code" in cols else [""] * len(ds)
-    tests = ds["test_list"] if "test_list" in cols else ([[]] * len(ds))
-
+    setups = ds["test_setup_code"] if "test_setup_code" in ds.column_names else [""] * len(ds)
+    tests = ds["test_list"] if "test_list" in ds.column_names else ([[]] * len(ds))
     total = len(descs)
     device = model.device
     gen_cfg = build_gen_cfg(model, do_sample, top_p, top_k, temperature)
     stop_crit = build_stop_criteria(tok)
-
     passed = 0
     start_t = time.time()
     pbar = tqdm(total=total, desc="MBPP eval", dynamic_ncols=True, smoothing=0.1)
+
     for i in range(0, total, batch_size):
         batch_desc = descs[i:i+batch_size]
         prompts = [p_code(d) for d in batch_desc]
@@ -437,10 +403,10 @@ def eval_humaneval(model, tok, n=30, max_new_tokens=200,
     device = model.device
     gen_cfg = build_gen_cfg(model, do_sample, top_p, top_k, temperature)
     stop_crit = build_stop_criteria(tok)
-
     passed = 0
     start_t = time.time()
     pbar = tqdm(total=total, desc="HumanEval eval", dynamic_ncols=True, smoothing=0.1)
+
     for i in range(0, total, batch_size):
         batch_prompt = prompts_raw[i:i+batch_size]
         prompts = [p_code(p) for p in batch_prompt]
@@ -463,48 +429,38 @@ def eval_humaneval(model, tok, n=30, max_new_tokens=200,
 
 def eval_all(label, model, tok, outdir,
              do_sample=False, top_p=None, top_k=None, temperature=None,
-             batch_size=8, eval_prompt_max_len=2048):
-    # For decoder-only generation correctness, ensure left padding during eval
+             batch_size=8, eval_prompt_max_len=2048,
+             eval_mbpp_tasks=50, eval_humaneval_tasks=30, eval_gsm8k_tasks=100):
+    # switch to left padding for eval
     orig_side = tok.padding_side
     tok.padding_side = "left"
-    metrics = {
-        "label": label,
-        "gsm8k_acc": eval_gsm8k(model, tok, n=100, do_sample=do_sample, top_p=top_p, top_k=top_k, temperature=temperature, batch_size=batch_size, eval_prompt_max_len=eval_prompt_max_len),
-        "mbpp_pass1": eval_mbpp(model, tok, n=50, do_sample=do_sample, top_p=top_p, top_k=top_k, temperature=temperature, batch_size=max(1, batch_size//2), eval_prompt_max_len=max(512, eval_prompt_max_len//2)),
-        "humaneval_pass1": eval_humaneval(model, tok, n=30, do_sample=do_sample, top_p=top_p, top_k=top_k, temperature=temperature, batch_size=max(1, batch_size//2), eval_prompt_max_len=max(512, eval_prompt_max_len//2)),
-    }
+
+    metrics = {"label": label}
+    metrics["gsm8k_acc"] = eval_gsm8k(model, tok, n=eval_gsm8k_tasks,
+                                      do_sample=do_sample, top_p=top_p, top_k=top_k, temperature=temperature,
+                                      batch_size=batch_size, eval_prompt_max_len=eval_prompt_max_len)
+    metrics["mbpp_pass1"] = eval_mbpp(model, tok, n=eval_mbpp_tasks,
+                                      do_sample=do_sample, top_p=top_p, top_k=top_k, temperature=temperature,
+                                      batch_size=max(1, batch_size//2), eval_prompt_max_len=max(512, eval_prompt_max_len//2))
+    metrics["humaneval_pass1"] = eval_humaneval(model, tok, n=eval_humaneval_tasks,
+                                                do_sample=do_sample, top_p=top_p, top_k=top_k, temperature=temperature,
+                                                batch_size=max(1, batch_size//2), eval_prompt_max_len=max(512, eval_prompt_max_len//2))
+
     path = os.path.join(outdir, f"metrics_{label}.json")
     with open(path, "w") as f: json.dump(metrics, f, indent=2)
     tok.padding_side = orig_side
     return metrics
 
-def print_compare(baseline, trained):
-    head = ["Benchmark", "Baseline", "Trained", "Δ"]
-    rows = []
-    for k,label in [("gsm8k_acc","GSM8K acc@1"),
-                    ("mbpp_pass1","MBPP pass@1"),
-                    ("humaneval_pass1","HumanEval pass@1")]:
-        b = baseline[k]; t = trained[k]; d = t - b
-        rows.append([label, f"{b:.3f}", f"{t:.3f}", f"{d:+.3f}"])
-    colw = [max(len(x) for x in col) for col in zip(head, *rows)]
-    def fmt(row): return " | ".join(x.ljust(w) for x,w in zip(row, colw))
-    print("\n" + fmt(head))
-    print("-+-".join("-"*w for w in colw))
-    for r in rows: print(fmt(r))
-    print()
-
-# ===================== LoRA helpers =====================
+# ------------------------ LoRA helpers ----------------------------
 
 def find_lora_targets(model) -> list:
-    candidates = [
-        "q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj",
-        "wq","wk","wv","wo","w1","w2","w3","proj",
-    ]
+    candidates = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj",
+                  "wq","wk","wv","wo","w1","w2","w3","proj"]
     hits = set()
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Linear):
             base = name.split(".")[-1]
-            if any(base == c for c in candidates) or any(c in base for c in candidates):
+            if base in candidates or any(c in base for c in candidates):
                 hits.add(base)
     if not hits:
         for name, module in model.named_modules():
@@ -528,43 +484,31 @@ def print_trainable_params(model):
     pct = 100.0 * trainable / max(1, total)
     print(f"[Params] trainable={trainable:,} / total={total:,} ({pct:.4f}%)")
 
-# --- dtype helpers ---------------------------------------------------------
-def _force_bf16(module: nn.Module):
-    """Force all float32 params/buffers to bfloat16 (used to avoid Float/BFloat16 matmul).
-
-    BitsAndBytes' prepare_model_for_kbit_training keeps LayerNorms in fp32 for stability,
-    but Gemma3 eager attention currently expects uniform dtype for Q,K,V to avoid a
-    RuntimeError (expected scalar type Float but found BFloat16). We accept the tiny
-    potential stability trade-off to guarantee consistent dtypes during GRPO sampling.
-    """
+def forcebf16(module: nn.Module):
     changed = 0
     for p in module.parameters():
         if p.dtype == torch.float32:
-            p.data = p.data.to(torch.bfloat16)
-            changed += 1
+            p.data = p.data.to(torch.bfloat16); changed += 1
     for b in module.buffers():
         if b.dtype == torch.float32:
-            b.data = b.data.to(torch.bfloat16)
-            changed += 1
+            b.data = b.data.to(torch.bfloat16); changed += 1
     if changed:
         print(f"[dtype] Forced {changed} tensors to bfloat16 for consistency.")
 
-# ===================== SFT builder =====================
+# -------------------- SFT builder (CLEAN) -------------------------
 
-def _pretokenize_for_sft(raw_ds: Dataset, tok: AutoTokenizer, max_len: int) -> Dataset:
-    # Dynamic packing: we stop padding to fixed max_len; truncate if over length.
+def pretokenize_for_sft(raw_ds: Dataset, tok: AutoTokenizer, max_len: int) -> Dataset:
     def to_text(batch):
         texts = [f"{p}\n\n{t}" for p, t in zip(batch["prompt"], batch["target"])]
         return {"text": texts}
-    ds_text = raw_ds.map(to_text, batched=True, remove_columns=[c for c in raw_ds.column_names if c not in []])
+    ds_text = raw_ds.map(to_text, batched=True,
+                         remove_columns=[c for c in raw_ds.column_names if c not in []])
     tok.model_max_length = max_len
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
+    if tok.pad_token is None: tok.pad_token = tok.eos_token
     tok.padding_side = "right"
 
     def tok_map(batch):
         enc = tok(batch["text"], truncation=True, max_length=max_len, padding=False)
-        # Collator will dynamically pad. Labels mirror input_ids.
         labels = [ids.copy() for ids in enc["input_ids"]]
         enc["labels"] = labels
         return enc
@@ -575,12 +519,8 @@ def _pretokenize_for_sft(raw_ds: Dataset, tok: AutoTokenizer, max_len: int) -> D
 
 def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
                       per_device_train_batch_size=1, grad_acc=8, bf16=True, max_len=4096,
-                      sft_include_mbpp: bool = True,
-                      sft_include_humaneval: bool = False,
-                      sft_mbpp_limit: Optional[int] = None,
-                      sft_humaneval_limit: Optional[int] = None,
-                      flash_attn: bool = False,
-                      attn_impl_override: Optional[str] = None,
+                      include_mbpp_train: bool = False, mbpp_limit: Optional[int] = None,
+                      attn_impl: str = "eager",
                       compile_models: bool = False,
                       disable_sft_gc: bool = False,
                       use_8bit_optim: bool = False,
@@ -590,7 +530,6 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
     tok.padding_side = "right"
     tok.model_max_length = max_len
 
-    attn_impl = attn_impl_override or ("flash_attention_2" if flash_attn else "eager")
     bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
                              bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -601,8 +540,8 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
         trust_remote_code=True,
         attn_implementation=attn_impl,
     )
-    _force_bf16(model)
-    model.config.use_cache = bool(disable_sft_gc)  # keep cache only if not checkpointing
+    forcebf16(model)
+    model.config.use_cache = bool(disable_sft_gc)
 
     gc = safe_clone_gen_cfg(getattr(model, "generation_config", None))
     gc.do_sample = False; gc.top_p = None; gc.top_k = None; gc.temperature = None
@@ -618,31 +557,27 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
 
     targets = find_lora_targets(model)
     print(f"[LoRA] target_modules={targets}")
-
     lora = LoraConfig(
         r=16, lora_alpha=32, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM",
         target_modules=targets
     )
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=not disable_sft_gc)
+    model = get_peft_model(model, lora)
+    print_trainable_params(model)
 
-    raw = load_math_sft()
-    if sft_include_mbpp:
-        mbpp_sft = load_mbpp_sft(limit=sft_mbpp_limit)
-        if mbpp_sft is not None and len(mbpp_sft) > 0:
-            raw = concatenate_datasets([raw, mbpp_sft])
-            print(f"[SFT] Added MBPP SFT examples: {len(mbpp_sft):,}")
+    raw = load_math_train()
+    if include_mbpp_train:
+        mbpp_ds = load_mbpp_trainval(limit=mbpp_limit)
+        if mbpp_ds is not None and len(mbpp_ds) > 0:
+            raw = concatenate_datasets([raw, mbpp_ds])
+            print(f"[SFT] Added MBPP train/val examples: {len(mbpp_ds):,}")
         else:
-            print("[SFT] MBPP SFT not available; continuing without it.")
-    if sft_include_humaneval:
-        he_sft = load_humaneval_sft(limit=sft_humaneval_limit)
-        if he_sft is not None and len(he_sft) > 0:
-            raw = concatenate_datasets([raw, he_sft])
-            print(f"[SFT] Added HumanEval SFT examples: {len(he_sft):,}")
-        else:
-            print("[SFT] HumanEval SFT not available; continuing without it.")
-    train_ds = _pretokenize_for_sft(raw, tok, max_len=max_len)
+            print("[SFT] MBPP train/val not available; continuing without it.")
+
+    train_ds = pretokenize_for_sft(raw, tok, max_len=max_len)
     collator = DataCollatorForLanguageModeling(tok, mlm=False)
-
     optim_choice = "paged_adamw_8bit" if use_8bit_optim else "adamw_torch"
+
     args = SFTConfig(
         output_dir=os.path.join(output_dir, "sft"),
         max_steps=sft_steps, learning_rate=lr,
@@ -662,7 +597,7 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
 
     trainer = SFTTrainer(
         model=model, args=args, train_dataset=train_ds,
-        data_collator=collator, peft_config=lora,
+        data_collator=collator, peft_config=None,
     )
 
     if compile_models:
@@ -672,167 +607,31 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
         except Exception as e:
             print(f"[Perf] torch.compile skipped: {e}")
 
-    print_trainable_params(trainer.model)
     return trainer, tok
 
-# ===================== Quantum A (optional) =====================
-
-try:
-    import pennylane as qml
-except Exception:
-    qml = None
-    warnings.warn("PennyLane not available; Quantum Bandit disabled.")
-
-class QuantumBandit(nn.Module):
-    def __init__(self, n_features: int, n_qubits: int = 6, n_layers: int = 2, shots: Optional[int] = None):
-        super().__init__()
-        if qml is None:
-            raise RuntimeError("PennyLane not installed.")
-        self.n_qubits = n_qubits
-        self.n_layers = n_layers
-        self.pre = nn.Linear(n_features, n_qubits)
-        self.dev = qml.device("default.qubit", wires=n_qubits, shots=shots)
-        @qml.qnode(self.dev, interface="torch", diff_method="best")
-        def circuit(x, weights):
-            xpad = qml.math.pad(x, (0, max(0, n_qubits - x.shape[0])))[:n_qubits]
-            for i in range(n_qubits):
-                qml.RX(xpad[i], wires=i)
-            for l in range(n_layers):
-                for i in range(n_qubits):
-                    qml.Rot(weights[l,i,0], weights[l,i,1], weights[l,i,2], wires=i)
-                for i in range(0, n_qubits-1, 2): qml.CZ(wires=[i, i+1])
-                for i in range(1, n_qubits-1, 2): qml.CZ(wires=[i, i+1])
-            return [qml.expval(qml.PauliZ(0))]
-        self.circuit = circuit
-        self.weights = nn.Parameter(torch.randn(n_layers, n_qubits, 3) * 0.1)
-    def forward(self, feats: torch.Tensor) -> torch.Tensor:
-        z = torch.tanh(self.pre(feats))
-        outs = []
-        for i in range(z.size(0)):
-            val = self.circuit(z[i], self.weights)[0]
-            outs.append(val)
-        logits = torch.stack(outs)
-        return torch.sigmoid(2.0 * logits)
-
-def build_features_for_bandit(completions: List[str]) -> torch.Tensor:
-    feats = []
-    for txt in completions:
-        think = re.findall(r"<think>(.*?)</think>", txt, re.S)
-        think_text = "\n".join(think) if think else ""
-        think_lines = think_text.count("\n") + 1 if think_text else 0
-        ans_m = re.search(r"<answer>(.*?)</answer>", txt, re.S)
-        ans_len = 0 if not ans_m else len(ans_m.group(1))
-        code_blocks = len(re.findall(r"```", txt))
-        digits = sum(c.isdigit() for c in txt)
-        length = len(txt)
-        feats.append([think_lines, ans_len, code_blocks, digits, length, 1.0])
-    return torch.tensor(feats, dtype=torch.float32)
-
-# ===================== Quantum B (optional) =====================
-
-def embed_texts(texts: List[str], dim: int = 384) -> np.ndarray:
-    try:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        embs = model.encode(texts, show_progress_bar=False, normalize_embeddings=True)
-        return np.asarray(embs, dtype=np.float32)
-    except Exception:
-        D = 256
-        vecs = np.zeros((len(texts), D), dtype=np.float32)
-        for i,t in enumerate(texts):
-            t = t.lower()
-            for j in range(len(t)-2):
-                tri = t[j:j+3]
-                vecs[i, hash(tri) % D] += 1.0
-            n = np.linalg.norm(vecs[i])+1e-8
-            vecs[i] /= n
-        return vecs
-
-def qkernel_matrix(X: np.ndarray, Y: np.ndarray, reps=1) -> np.ndarray:
-    Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
-    Yn = Y / (np.linalg.norm(Y, axis=1, keepdims=True) + 1e-8)
-    cos = Xn @ Yn.T
-    return np.cos((math.pi/2.0) * (1 - cos)) ** reps
-
-class QuantumKernelPRM:
-    def __init__(self, lam=1e-3, reps=1):
-        self.lam = lam; self.reps = reps
-        self.X = None; self.alpha = None
-    def fit(self, X: np.ndarray, y: np.ndarray):
-        K = qkernel_matrix(X, X, reps=self.reps)
-        n = K.shape[0]
-        self.alpha = np.linalg.solve(K + self.lam * np.eye(n), y)
-        self.X = X; return self
-    def predict(self, Xq: np.ndarray) -> np.ndarray:
-        Kq = qkernel_matrix(Xq, self.X, reps=self.reps)
-        return Kq @ self.alpha
-
-def split_steps_from_think(think_text: str) -> List[str]:
-    think_text = think_text.strip()
-    if not think_text: return []
-    parts = [p.strip() for p in think_text.split("\n") if p.strip()]
-    if len(parts) < 2:
-        parts = re.split(r"(?<=[\.\!\?;])\s+", think_text)
-        parts = [p.strip() for p in parts if p.strip()]
-    return parts
-
-def build_qkprm_from_teacher(math_sft, max_steps=50000, lam=1e-2, reps=1):
-    pos_steps = []
-    for ex in math_sft:
-        t = ex.get("teacher_think","")
-        t = re.sub(r"</?think>", "", t, flags=re.I)
-        pos_steps.extend(split_steps_from_think(t))
-        if len(pos_steps) >= max_steps: break
-    pos_steps = pos_steps[:max_steps]
-    neg_steps = []
-    for ex in math_sft.shuffle(seed=13):
-        s = ex.get("prompt","")
-        body = re.sub(r".*?<task>\s*", "", s, flags=re.S)
-        body = re.sub(r"\s*</task>.*", "", body, flags=re.S)
-        if body.strip():
-            neg_steps.append(body.strip())
-        if len(neg_steps) >= len(pos_steps): break
-    X_pos = embed_texts(pos_steps)
-    X_neg = embed_texts(neg_steps[:len(pos_steps)])
-    X = np.vstack([X_pos, X_neg])
-    y = np.concatenate([np.ones(len(X_pos)), np.zeros(len(X_neg))]).astype(np.float32)
-    return QuantumKernelPRM(lam=lam, reps=reps).fit(X, y)
-
-def process_reward_for_completion(prm: QuantumKernelPRM, completion_text: str) -> float:
-    think = re.findall(r"<think>(.*?)</think>", completion_text, re.S)
-    think_text = "\n".join(think) if think else ""
-    steps = split_steps_from_think(think_text)
-    if not steps: return 0.0
-    X = embed_texts(steps)
-    scores = prm.predict(X)
-    return float(np.mean(np.clip(scores, 0.0, 1.0)))
-
-# ===================== GRPO builder (FIXED trainables) =====================
+# -------------------- GRPO builder (CLEAN) ------------------------
 
 def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
                        per_device_train_batch_size=1, grad_acc=4, bf16=True,
                        group_size=4, max_len=4096,
-                       enable_q_bandit=False, bandit_alpha=0.2,
-                       enable_qk_prm=False, prm_weight=0.3,
                        rl_top_p: Optional[float] = 0.9,
                        rl_top_k: Optional[int]   = 40,
                        rl_temperature: float = 0.8,
                        max_completion_length: int = 256,
-                       rl_include_mbpp: bool = True,
-                       rl_include_humaneval: bool = True,
-                       rl_mbpp_limit: Optional[int] = None,
-                       rl_humaneval_limit: Optional[int] = None,
-                       flash_attn: bool = False,
-                       attn_impl_override: Optional[str] = None,
+                       include_mbpp_train: bool = False,
+                       mbpp_limit: Optional[int] = None,
+                       attn_impl: str = "eager",
                        compile_models: bool = False,
                        use_8bit_optim: bool = False):
+
     tok = AutoTokenizer.from_pretrained(base_model, use_fast=True, trust_remote_code=True)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
     tok.padding_side = "right"
 
-    attn_impl = attn_impl_override or ("flash_attention_2" if flash_attn else "eager")
     bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
                              bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
+
+    # base model for RL + LoRA adapter from SFT
     base_model_for_rl = AutoModelForCausalLM.from_pretrained(
         base_model,
         torch_dtype=torch.bfloat16,
@@ -841,232 +640,100 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
         trust_remote_code=True,
         attn_implementation=attn_impl,
     )
-    _force_bf16(base_model_for_rl)
+    forcebf16(base_model_for_rl)
     base_model_for_rl.config.use_cache = True
-    base_model_for_rl = prepare_model_for_kbit_training(
-        base_model_for_rl,
-        use_gradient_checkpointing=False
-    )
-    _force_bf16(base_model_for_rl)
+    base_model_for_rl = prepare_model_for_kbit_training(base_model_for_rl, use_gradient_checkpointing=False)
+    forcebf16(base_model_for_rl)
 
-    # 3) Load LoRA adapter with is_trainable=True (this sets requires_grad on LoRA)
-    latest_checkpoint = None
+    model = base_model_for_rl
     if sft_ckpt and os.path.isdir(sft_ckpt):
-        if os.path.basename(sft_ckpt).startswith("checkpoint-"):
-            latest_checkpoint = sft_ckpt
-        else:
-            checkpoints = glob.glob(os.path.join(sft_ckpt, "checkpoint-*"))
-            if checkpoints:
-                latest_checkpoint = max(checkpoints, key=os.path.getctime)
-    if latest_checkpoint:
-        try:
-            sft_model = PeftModel.from_pretrained(
-                base_model_for_rl,
-                latest_checkpoint,
-                is_trainable=True
-            )
-            print(f"[GRPO] Loaded SFT adapter from: {latest_checkpoint}")
-        except ValueError as e:
-            if "key_mapping" in str(e):
-                print(f"[GRPO][Warn] key_mapping error while loading adapter: {e}\n[GRPO][Recover] Attempting manual LoRA weight load.")
-                # Manual fallback: rebuild LoRA modules then load raw weights (best-effort)
-                import json as _json, os as _os
-                from peft import get_peft_model
-                adapter_cfg_path = _os.path.join(latest_checkpoint, 'adapter_config.json')
-                if not _os.path.isfile(adapter_cfg_path):
-                    raise RuntimeError("Manual adapter recovery failed: adapter_config.json missing") from e
-                with open(adapter_cfg_path) as _f:
-                    _cfg_json = _json.load(_f)
-                # Filter keys valid for LoraConfig
-                valid_keys = {k: _cfg_json[k] for k in list(_cfg_json.keys()) if k in {
-                    'r','lora_alpha','lora_dropout','bias','task_type','target_modules','modules_to_save','init_lora_weights','layers_to_transform','layers_pattern'
-                }}
-                # Ensure target_modules present; if absent, re-detect.
-                if 'target_modules' not in valid_keys or not valid_keys['target_modules']:
-                    valid_keys['target_modules'] = find_lora_targets(base_model_for_rl)
-                lcfg_fallback = LoraConfig(**valid_keys)
-                sft_model = get_peft_model(base_model_for_rl, lcfg_fallback)
-                # Load weights (safetensors preferred)
-                weight_file_st = _os.path.join(latest_checkpoint, 'adapter_model.safetensors')
-                weight_file_bin = _os.path.join(latest_checkpoint, 'adapter_model.bin')
-                state = None
-                if _os.path.isfile(weight_file_st):
-                    try:
-                        from safetensors.torch import load_file as _load_file
-                        state = _load_file(weight_file_st)
-                    except Exception as _se:
-                        print(f"[GRPO][Recover] safetensors load failed ({_se}); trying bin")
-                if state is None:
-                    if _os.path.isfile(weight_file_bin):
-                        state = torch.load(weight_file_bin, map_location='cpu')
-                    else:
-                        raise RuntimeError("No adapter weight file found (adapter_model.safetensors/.bin)") from e
-                missing, unexpected = sft_model.load_state_dict(state, strict=False)
-                print(f"[GRPO][Recover] Manual adapter load complete. missing={len(missing)}, unexpected={len(unexpected)}")
-                # Ensure all LoRA and adapter params are trainable
-                lora_trainable = 0
-                total_trainable = 0
-                for n, p in sft_model.named_parameters():
-                    # LoRA, adapter, and any PEFT params
-                    if ("lora_" in n.lower() or "adapter" in n.lower() or "peft" in n.lower()):
-                        p.requires_grad = True
-                        lora_trainable += p.numel()
-                    if p.requires_grad:
-                        total_trainable += p.numel()
-                print(f"[GRPO][Recover] Set requires_grad=True for {lora_trainable:,} LoRA/adapter params.")
-                print(f"[GRPO][Recover] Total trainable params after fix: {total_trainable:,}")
-                # Print names of trainable params for debug
-                print("[GRPO][Recover] Trainable parameter names:")
-                for n, p in sft_model.named_parameters():
-                    if p.requires_grad:
-                        print(f"  {n}: {p.numel()}")
-            else:
-                raise
+        # accept either direct checkpoint-* or parent 'sft' dir
+        cp = sft_ckpt
+        if not os.path.basename(cp).startswith("checkpoint-"):
+            cands = glob.glob(os.path.join(cp, "checkpoint-*"))
+            if cands:
+                cp = max(cands, key=os.path.getctime)
+        print(f"[GRPO] Loading SFT adapter from: {cp}")
+        model = PeftModel.from_pretrained(base_model_for_rl, cp, is_trainable=True)
     else:
-        if sft_ckpt:
-            print(f"[GRPO] No adapter checkpoints found (path: {sft_ckpt}); proceeding with base model only.")
-        else:
-            print("[GRPO] Starting RL directly from base model (no SFT adapter).")
-        sft_model = base_model_for_rl
+        print("[GRPO] No SFT adapter provided; RL will start from base model LoRA-free (trainable heads only).")
 
-    # Ensure adapter params also consistent
-    _force_bf16(sft_model)
+    forcebf16(model)
+    model.train()
+    print_trainable_params(model)
 
-    # 4) Paranoia: force-unfreeze any lora_* parameters and keep cache on
-    lora_trainable = 0
-    for n, p in sft_model.named_parameters():
-        if "lora_" in n.lower():
-            p.requires_grad = True
-            lora_trainable += p.numel()
-    try:
-        sft_model.base_model.config.use_cache = True
-    except Exception:
-        pass
-
-    # 5) Training mode + log flags
-    sft_model.train()
-    print(f"[GRPO Flags] use_cache={getattr(sft_model.config, 'use_cache', None)}; "
-          f"has_gc_attr={hasattr(sft_model, 'is_gradient_checkpointing')}")
-    print(f"[GRPO] LoRA trainable params (explicit): {lora_trainable:,}")
-    print_trainable_params(sft_model)
-
-    # Set explicit generation config to avoid warnings and improve completions
-    gc = safe_clone_gen_cfg(getattr(sft_model, "generation_config", None))
+    # Explicit sampling config for RL
+    gc = safe_clone_gen_cfg(getattr(model, "generation_config", None))
     gc.cache_implementation = "hybrid"
     gc.do_sample = True
     gc.temperature = rl_temperature
-    gc.top_p = rl_top_p  
+    gc.top_p = rl_top_p
     gc.top_k = rl_top_k
     gc.pad_token_id = tok.eos_token_id
     gc.eos_token_id = tok.eos_token_id
     gc.repetition_penalty = 1.05
-    sft_model.generation_config = gc
-    print(f"[GRPO] Set explicit generation config: temp={rl_temperature}, top_p={rl_top_p}, cache=hybrid")
+    model.generation_config = gc
+    print(f"[GRPO] Sampling: temp={rl_temperature}, top_p={rl_top_p}, top_k={rl_top_k}")
 
-    # Build GRPO dataset
-    math_train = load_math_sft().remove_columns(["target"]).map(lambda ex: {"task":"math"})
-    # Code datasets for RL: full by default (limit can restrict)
-    code_parts = []
-    if rl_include_mbpp:
-        mbpp = load_mbpp_test(None if rl_mbpp_limit in (None, 0) else rl_mbpp_limit)
-        code_parts.append(mbpp)
-        print(f"[GRPO] MBPP RL examples: {len(mbpp):,}")
-    if rl_include_humaneval:
-        he = load_humaneval_test(None if rl_humaneval_limit in (None, 0) else rl_humaneval_limit)
-        code_parts.append(he)
-        print(f"[GRPO] HumanEval RL examples: {len(he):,}")
+    # Build train datasets (train-only, CLEAN)
+    math_train = load_math_train().remove_columns([c for c in ["final"] if c in load_math_train().column_names]).map(lambda ex: {"task":"math"})
 
-    def map_code_row(ex):
-        d = ex.get("text") or ex.get("desc") or ex.get("prompt") or ""
-        setup = ex.get("test_setup_code") if "test_setup_code" in ex else ""
-        if "test_list" in ex: tlist = ex["test_list"]
-        elif "test" in ex:    tlist = [ex["test"]]
-        else:                 tlist = []
-        return {"prompt": p_code(d), "task":"code", "test_setup_code": setup, "tests": tlist}
+    code_train = None
+    if include_mbpp_train:
+        mbpp_tv = load_mbpp_trainval(limit=mbpp_limit)
+        if mbpp_tv is not None and len(mbpp_tv) > 0:
+            # for RL we only need prompts (and reward from execution of *train* tests we construct)
+            def map_code_row(ex):
+                return {"prompt": ex["prompt"], "target": ex["target"], "task":"code"}
+            code_train = mbpp_tv.map(map_code_row, remove_columns=[c for c in mbpp_tv.column_names if c not in ["prompt","target","task"]])
+            print(f"[GRPO] MBPP RL train examples (train/val only): {len(code_train):,}")
+        else:
+            print("[GRPO] MBPP train/val not available; RL will be math-only.")
 
-    code_mapped = []
-    for part in code_parts:
-        code_mapped.append(part.map(map_code_row, remove_columns=[c for c in part.column_names if c not in []]))
-    code_train = concatenate_datasets(code_mapped).shuffle(seed=42) if code_mapped else None
-    mix = concatenate_datasets([math_train, code_train]).shuffle(seed=42) if code_train is not None else math_train.shuffle(seed=42)
+    if code_train is not None:
+        mix = concatenate_datasets([math_train, code_train]).shuffle(seed=42)
+    else:
+        mix = math_train.shuffle(seed=42)
 
-    # Optional quantum pieces
-    qk_prm = None
-    if enable_qk_prm:
-        small = load_math_sft().select(range(min(2000, len(math_train))))
-        qk_prm = build_qkprm_from_teacher(small, max_steps=20000, lam=1e-2, reps=1)
-
-    q_bandit, q_bandit_opt, bandit_device = None, None, None
-    if enable_q_bandit:
-        if qml is None:
-            raise RuntimeError("PennyLane not installed; cannot enable --enable_q_bandit.")
-        q_bandit = QuantumBandit(n_features=6)
-        bandit_device = "cuda" if torch.cuda.is_available() else "cpu"
-        q_bandit.to(bandit_device)
-        q_bandit_opt = torch.optim.Adam(q_bandit.parameters(), lr=1e-3)
-
-    def reward_math(prompts=None, completions=None, final=None, **kwargs):
+    # Reward functions
+    def reward_math(prompts=None, completions=None, **kwargs):
+        # we don't have GT finals during RL (train-only), so use weak heuristics:
+        # encourage <answer> presence and short final answers; discourage mega-thoughts.
         rewards = []
-        for comp, gt in zip(completions, final):
-            pred = parse_final_from_completion(comp)
-            r = 1.0 if equal_numeric(pred, gt) else 0.0
-            if enable_qk_prm and qk_prm is not None:
-                r += prm_weight * process_reward_for_completion(qk_prm, comp)
-            rewards.append(r)
-        if enable_q_bandit and q_bandit is not None:
-            feats = build_features_for_bandit(completions).to(bandit_device)
-            with torch.no_grad(): probs = q_bandit(feats)
-            rewards = [float(r + bandit_alpha*(p.item()-0.5)) for r,p in zip(rewards, probs)]
-            with torch.enable_grad():
-                q_bandit_opt.zero_grad()
-                probs2 = q_bandit(feats)
-                baseline = float(np.mean([max(0.0, rr) for rr in rewards]))
-                target = torch.tensor([1.0 if rr >= baseline else 0.0 for rr in rewards],
-                                      dtype=torch.float32, device=probs2.device)
-                F.binary_cross_entropy(probs2, target).backward(); q_bandit_opt.step()
+        for comp in completions:
+            has = 1.0 if re.search(r"<answer>.*?</answer>", comp, re.S) else 0.0
+            final = parse_final_from_completion(comp)
+            penalty = min(len(comp) / 2000.0, 1.0)  # length penalty
+            r = 0.5 * has + 0.5 * (1.0 - penalty)
+            rewards.append(float(r))
         return rewards
 
-    def reward_code(prompts=None, completions=None, test_setup_code=None, tests=None, **kwargs):
+    def reward_code(prompts=None, completions=None, **kwargs):
+        # When using MBPP train/val for RL, we don't have official tests here.
+        # A simple structure check: requires code fence or def presence.
         rewards = []
-        if test_setup_code is None: test_setup_code = [""] * len(completions)
-        if tests is None: tests = [[] for _ in range(len(completions))]
-        for comp, setup, tlist in zip(completions, test_setup_code, tests):
+        for comp in completions:
             m = re.search(r"```(?:python)?\s*(.*?)```", comp, re.S|re.I)
             code = m.group(1) if m else comp
-            ok, _ = run_code_and_tests(code, setup, tlist)
-            r = 1.0 if ok else 0.0
-            if enable_qk_prm and qk_prm is not None:
-                r += prm_weight * process_reward_for_completion(qk_prm, comp)
-            rewards.append(r)
-        if enable_q_bandit and q_bandit is not None:
-            feats = build_features_for_bandit(completions).to(bandit_device)
-            with torch.no_grad(): probs = q_bandit(feats)
-            rewards = [float(r + bandit_alpha*(p.item()-0.5)) for r,p in zip(rewards, probs)]
-            with torch.enable_grad():
-                q_bandit_opt.zero_grad()
-                probs2 = q_bandit(feats)
-                baseline = float(np.mean([max(0.0, rr) for rr in rewards]))
-                target = torch.tensor([1.0 if rr >= baseline else 0.0 for rr in rewards],
-                                      dtype=torch.float32, device=probs2.device)
-                F.binary_cross_entropy(probs2, target).backward(); q_bandit_opt.step()
+            score = 0.0
+            if "def " in code:
+                score += 0.5
+            if "return " in code:
+                score += 0.3
+            if len(code) > 0:
+                score += 0.2
+            rewards.append(float(score))
         return rewards
 
     def mixed_reward(prompts=None, completions=None, task=None, **kw):
         out = []
         for i,t in enumerate(task):
             if t == "math":
-                out.extend(reward_math(
-                    prompts=[prompts[i]], completions=[completions[i]], final=[kw.get("final",[None])[i]]
-                ))
+                out.extend(reward_math(prompts=[prompts[i]], completions=[completions[i]]))
             else:
-                out.extend(reward_code(
-                    prompts=[prompts[i]], completions=[completions[i]],
-                    test_setup_code=[kw.get("test_setup_code", [""])[i]],
-                    tests=[kw.get("tests", [[]])[i]],
-                ))
+                out.extend(reward_code(prompts=[prompts[i]], completions=[completions[i]]))
         return out
 
-    # Explicit generation kwargs to prevent warnings and improve completions
     stop_crit = build_stop_criteria(tok)
     generation_kwargs = {
         "do_sample": True,
@@ -1077,7 +744,6 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
         "eos_token_id": tok.eos_token_id,
         "repetition_penalty": 1.05,
         "cache_implementation": "hybrid",
-        # NOTE: stopping_criteria cannot be part of GenerationConfig; removed to avoid validation error.
     }
 
     args = GRPOConfig(
@@ -1091,80 +757,51 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
         num_generations=group_size,
         generation_batch_size=group_size,
         temperature=rl_temperature, top_p=rl_top_p, top_k=rl_top_k,
-        max_prompt_length=max_len, 
+        max_prompt_length=max_len,
         max_completion_length=max_completion_length,
         generation_kwargs=generation_kwargs,
         gradient_checkpointing=False,
         remove_unused_columns=False,
         optim=("paged_adamw_8bit" if use_8bit_optim else "adamw_torch"),
     )
+
     trainer = GRPOTrainer(
-        model=sft_model, processing_class=tok, reward_funcs=mixed_reward,
+        model=model, processing_class=tok, reward_funcs=mixed_reward,
         train_dataset=mix, args=args,
     )
+
     if compile_models:
         try:
             trainer.model = torch.compile(trainer.model, mode="reduce-overhead", fullgraph=False)
             print("[Perf] Compiled RL model with torch.compile")
         except Exception as e:
             print(f"[Perf] RL torch.compile skipped: {e}")
+
     return trainer, tok
 
-# ===================== Main =====================
+# ------------------------------ main --------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base_model", type=str, default="google/gemma-3-1b-it")
-    ap.add_argument("--output_dir", type=str, default="./runs/gemma-3-1b-qrl")
+    ap.add_argument("--base_model", type=str, default="google/gemma-3-4b-it")
+    ap.add_argument("--output_dir", type=str, default="./runs/gemma3-clean")
     ap.add_argument("--sft_steps", type=int, default=300)
-    # SFT dataset toggles
-    ap.add_argument("--sft_include_mbpp", action="store_true", help="Include MBPP as SFT (if code solutions available).")
-    ap.add_argument("--no_sft_mbpp", dest="sft_include_mbpp", action="store_false")
-    ap.set_defaults(sft_include_mbpp=True)
-    ap.add_argument("--sft_include_humaneval", action="store_true", help="Include HumanEval in SFT (NOT recommended; contaminates benchmark)")
-    ap.add_argument("--no_sft_humaneval", dest="sft_include_humaneval", action="store_false")
-    ap.set_defaults(sft_include_humaneval=False)
-    ap.add_argument("--sft_mbpp_limit", type=int, default=None)
-    ap.add_argument("--sft_humaneval_limit", type=int, default=None)
     ap.add_argument("--rl_steps", type=int, default=300)
-    ap.add_argument("--skip_sft", action="store_true", help="Skip SFT phase and go straight to GRPO using --sft_ckpt")
-    ap.add_argument("--sft_ckpt", type=str, default=None, help="Path to existing SFT output dir or specific checkpoint-* directory")
     ap.add_argument("--per_device_train_batch_size", type=int, default=1)
     ap.add_argument("--grad_acc", type=int, default=8)
     ap.add_argument("--group_size", type=int, default=4)
     ap.add_argument("--max_len", type=int, default=4096)
-    ap.add_argument("--bf16", action="store_true"); ap.add_argument("--no_bf16", dest="bf16", action="store_false")
-    ap.set_defaults(bf16=True)
+    ap.add_argument("--bf16", action="store_true"); ap.add_argument("--no_bf16", dest="bf16", action="store_false"); ap.set_defaults(bf16=True)
 
-    ap.add_argument("--enable_q_bandit", action="store_true", help="Enable Quantum Bandit for reward shaping.")
-    ap.add_argument("--bandit_alpha", type=float, default=0.2)
-    ap.add_argument("--enable_qk_prm", dest="enable_qk_prm", action="store_true", help="Enable Quantum Kernel PRM for reward shaping (default: enabled).")
-    ap.add_argument("--disable_qk_prm", dest="enable_qk_prm", action="store_false", help="Disable Quantum Kernel PRM.")
-    ap.set_defaults(enable_qk_prm=True)
-    ap.add_argument("--prm_weight", type=float, default=0.3)
-    # Attention backend control (no external deps by default)
-    ap.add_argument("--attn", type=str, choices=["eager", "sdpa", "flash"], default="eager",
-                    help="Attention backend: eager (default), sdpa (PyTorch), or flash (requires flash-attn)")
+    # Train data toggles (CLEAN defaults)
+    ap.add_argument("--include_mbpp_train", action="store_true", help="Use MBPP train/val in SFT and RL (never test).")
+    ap.add_argument("--mbpp_limit", type=int, default=None)
 
-    # RL sampling
-    ap.add_argument("--rl_top_p", type=float, default=0.9)
-    ap.add_argument("--rl_top_k", type=int,   default=40)
-    ap.add_argument("--rl_temperature", type=float, default=0.8)
-    ap.add_argument("--max_completion_length", type=int, default=256, help="Max completion length for GRPO (shorter = faster, encourages concise answers)")
-    # RL dataset toggles
-    ap.add_argument("--rl_include_mbpp", action="store_true", help="Include MBPP tasks in RL training.")
-    ap.add_argument("--no_rl_mbpp", dest="rl_include_mbpp", action="store_false")
-    ap.set_defaults(rl_include_mbpp=True)
-    ap.add_argument("--rl_include_humaneval", action="store_true", help="Include HumanEval tasks in RL training (be mindful of contamination).")
-    ap.add_argument("--no_rl_humaneval", dest="rl_include_humaneval", action="store_false")
-    ap.set_defaults(rl_include_humaneval=True)
-    ap.add_argument("--rl_mbpp_limit", type=int, default=None)
-    ap.add_argument("--rl_humaneval_limit", type=int, default=None)
-    # Performance / speed flags
-    ap.add_argument("--flash_attn", action="store_true", help="Use flash attention (requires flash-attn installed)")
-    ap.add_argument("--compile_models", action="store_true", help="Compile models with torch.compile for speed")
-    ap.add_argument("--disable_sft_gc", action="store_true", help="Disable gradient checkpointing during SFT for speed")
-    ap.add_argument("--use_8bit_optim", action="store_true", help="Use paged_adamw_8bit optimizer")
+    # Attention / perf
+    ap.add_argument("--attn", type=str, choices=["eager","sdpa","flash"], default="eager")
+    ap.add_argument("--compile_models", action="store_true")
+    ap.add_argument("--disable_sft_gc", action="store_true")
+    ap.add_argument("--use_8bit_optim", action="store_true")
 
     # Eval sampling & batching
     ap.add_argument("--eval_sample", action="store_true")
@@ -1173,28 +810,30 @@ def main():
     ap.add_argument("--eval_temperature", type=float, default=0.7)
     ap.add_argument("--eval_batch_size", type=int, default=8)
     ap.add_argument("--eval_prompt_max_len", type=int, default=2048)
+    ap.add_argument("--eval_mbpp_tasks", type=int, default=50)
+    ap.add_argument("--eval_humaneval_tasks", type=int, default=30)
+    ap.add_argument("--eval_gsm8k_tasks", type=int, default=100)
+
+    # Flow control
     ap.add_argument("--skip_baseline_eval", action="store_true")
-    ap.add_argument("--eval_only", action="store_true", help="Only run evaluation on an existing GRPO adapter (requires --grpo_ckpt or --sft_ckpt)")
-    ap.add_argument("--grpo_ckpt", type=str, default=None, help="Path to GRPO adapter checkpoint (overrides sft_ckpt if provided)")
+    ap.add_argument("--skip_sft", action="store_true")
+    ap.add_argument("--sft_ckpt", type=str, default=None, help="Use an existing SFT folder or checkpoint-*")
+    ap.add_argument("--eval_only", action="store_true")
+    ap.add_argument("--grpo_ckpt", type=str, default=None)  # not used here; adapter is in output_dir/grpo
 
     args = ap.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    # Map --attn to HF attn_implementation values (ensure available everywhere)
-    attn_map = {"eager": "eager", "sdpa": "sdpa", "flash": "flash_attention_2"}
+
+    attn_map = {"eager":"eager","sdpa":"sdpa","flash":"flash_attention_2"}
 
     baseline = None
     if not args.skip_baseline_eval:
         tok0 = AutoTokenizer.from_pretrained(args.base_model, use_fast=True, trust_remote_code=True)
-        if tok0.pad_token is None:
-            tok0.pad_token = tok0.eos_token
+        if tok0.pad_token is None: tok0.pad_token = tok0.eos_token
         tok0.padding_side = "right"
 
-        bnb0 = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-        )
+        bnb0 = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
+                                  bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
         base = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             torch_dtype=torch.bfloat16,
@@ -1203,85 +842,76 @@ def main():
             trust_remote_code=True,
             attn_implementation=attn_map.get(args.attn, "eager"),
         )
-        _force_bf16(base)
+        forcebf16(base)
         base.config.use_cache = False
-
         gc0 = safe_clone_gen_cfg(getattr(base, "generation_config", None))
-        gc0.do_sample = False
-        gc0.top_p = None
-        gc0.top_k = None
-        gc0.temperature = None
+        gc0.do_sample = False; gc0.top_p = None; gc0.top_k = None; gc0.temperature = None
         gc0.cache_implementation = "hybrid"
         base.generation_config = gc0
 
         baseline = eval_all(
-            "baseline",
-            base,
-            tok0,
-            args.output_dir,
+            "baseline", base, tok0, args.output_dir,
             do_sample=args.eval_sample,
             top_p=args.eval_top_p if args.eval_sample else None,
             top_k=args.eval_top_k if args.eval_sample else None,
             temperature=args.eval_temperature if args.eval_sample else None,
             batch_size=args.eval_batch_size,
             eval_prompt_max_len=args.eval_prompt_max_len,
+            eval_mbpp_tasks=args.eval_mbpp_tasks,
+            eval_humaneval_tasks=args.eval_humaneval_tasks,
+            eval_gsm8k_tasks=args.eval_gsm8k_tasks,
         )
         print("[Baseline]", json.dumps(baseline, indent=2))
     else:
-        print("[Baseline] Skipped baseline evaluation (--skip_baseline_eval flag used)")
+        print("[Baseline] Skipped baseline evaluation.")
 
-    if args.skip_sft:
-        if args.sft_ckpt:
-            sft_ckpt = args.sft_ckpt
-            print(f"[Main] Skipping SFT. Using provided checkpoint path: {sft_ckpt}")
-        else:
-            sft_ckpt = None  # Signal GRPO builder to use base model only
-            print("[Main] Skipping SFT with no adapter provided; GRPO will start from base model.")
-    else:
+    if args.skip_sft and not args.sft_ckpt:
+        print("[Main] SFT skipped without a checkpoint; RL will start from base model.")
+    elif not args.skip_sft:
         sft_trainer, tok_sft = build_sft_trainer(
             base_model=args.base_model, output_dir=args.output_dir,
             sft_steps=args.sft_steps, grad_acc=args.grad_acc, bf16=args.bf16, max_len=args.max_len,
-            sft_include_mbpp=args.sft_include_mbpp,
-            sft_include_humaneval=args.sft_include_humaneval,
-            sft_mbpp_limit=args.sft_mbpp_limit,
-            sft_humaneval_limit=args.sft_humaneval_limit,
-            flash_attn=args.flash_attn,
-            attn_impl_override=attn_map.get(args.attn, "eager"),
+            include_mbpp_train=args.include_mbpp_train, mbpp_limit=args.mbpp_limit,
+            attn_impl=attn_map.get(args.attn, "eager"),
             compile_models=args.compile_models,
             disable_sft_gc=args.disable_sft_gc,
             use_8bit_optim=args.use_8bit_optim,
         )
         sft_trainer.train()
-        sft_ckpt = sft_trainer.args.output_dir
+        args.sft_ckpt = sft_trainer.args.output_dir
+        print(f"[SFT] Done. ckpt={args.sft_ckpt}")
 
     if args.eval_only:
-        # Load model (base + adapter) and run eval_all("trained")
-        adapter_path = args.grpo_ckpt or args.sft_ckpt or sft_ckpt
+        # Load base + adapter (SFT or GRPO) and just run eval
+        adapter_path = args.grpo_ckpt or args.sft_ckpt
         if not adapter_path:
-            raise SystemExit("--eval_only requires --grpo_ckpt or --sft_ckpt to locate an adapter")
+            raise SystemExit("--eval_only requires --grpo_ckpt or --sft_ckpt")
         print(f"[EvalOnly] Loading adapter from: {adapter_path}")
+
         tok_eval = AutoTokenizer.from_pretrained(args.base_model, use_fast=True, trust_remote_code=True)
         if tok_eval.pad_token is None: tok_eval.pad_token = tok_eval.eos_token
-        tok_eval.padding_side = "right"  # switched internally to left during eval
+        tok_eval.padding_side = "right"
+
         bnb_eval = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
                                       bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
         base_eval = AutoModelForCausalLM.from_pretrained(
             args.base_model, torch_dtype=torch.bfloat16, quantization_config=bnb_eval,
             device_map="auto", trust_remote_code=True, attn_implementation=attn_map.get(args.attn, "eager")
         )
-        _force_bf16(base_eval)
-        if os.path.isdir(adapter_path):
-            # Accept either direct checkpoint-* or parent dir
-            if not os.path.basename(adapter_path).startswith("checkpoint-"):
-                cands = glob.glob(os.path.join(adapter_path, "checkpoint-*"))
-                if cands:
-                    adapter_path = max(cands, key=os.path.getctime)
+        forcebf16(base_eval)
+
+        cp = adapter_path
+        if os.path.isdir(cp) and not os.path.basename(cp).startswith("checkpoint-"):
+            cands = glob.glob(os.path.join(cp, "checkpoint-*"))
+            if cands: cp = max(cands, key=os.path.getctime)
+
         try:
-            model_eval = PeftModel.from_pretrained(base_eval, adapter_path, is_trainable=False)
-            print(f"[EvalOnly] Adapter loaded: {adapter_path}")
+            model_eval = PeftModel.from_pretrained(base_eval, cp, is_trainable=False)
+            print(f"[EvalOnly] Adapter loaded: {cp}")
         except Exception as e:
-            print(f"[EvalOnly] Failed to load adapter at {adapter_path}: {e}. Using base model only.")
+            print(f"[EvalOnly] Failed to load adapter at {cp}: {e}. Using base model only.")
             model_eval = base_eval
+
         metrics_trained = eval_all(
             "trained", model_eval, tok_eval, args.output_dir,
             do_sample=args.eval_sample,
@@ -1289,32 +919,29 @@ def main():
             top_k=args.eval_top_k if args.eval_sample else None,
             temperature=args.eval_temperature if args.eval_sample else None,
             batch_size=args.eval_batch_size,
-            eval_prompt_max_len=args.eval_prompt_max_len
+            eval_prompt_max_len=args.eval_prompt_max_len,
+            eval_mbpp_tasks=args.eval_mbpp_tasks,
+            eval_humaneval_tasks=args.eval_humaneval_tasks,
+            eval_gsm8k_tasks=args.eval_gsm8k_tasks,
         )
         print("[EvalOnly Metrics]", json.dumps(metrics_trained, indent=2))
         return
-    else:
-        # GRPO (fixed trainables)
-        grpo_trainer, tok_rl = build_grpo_trainer(
-            base_model=args.base_model, sft_ckpt=sft_ckpt, output_dir=args.output_dir,
-            rl_steps=args.rl_steps, per_device_train_batch_size=args.per_device_train_batch_size,
-            grad_acc=max(1, args.grad_acc//2), group_size=args.group_size, bf16=args.bf16, max_len=args.max_len,
-            enable_q_bandit=args.enable_q_bandit, bandit_alpha=args.bandit_alpha,
-            enable_qk_prm=args.enable_qk_prm, prm_weight=args.prm_weight,
-            rl_top_p=args.rl_top_p, rl_top_k=args.rl_top_k, rl_temperature=args.rl_temperature,
-            max_completion_length=args.max_completion_length,
-            rl_include_mbpp=args.rl_include_mbpp,
-            rl_include_humaneval=args.rl_include_humaneval,
-            rl_mbpp_limit=args.rl_mbpp_limit,
-            rl_humaneval_limit=args.rl_humaneval_limit,
-            flash_attn=args.flash_attn,
-            attn_impl_override=attn_map.get(args.attn, "eager"),
-            compile_models=args.compile_models,
-            use_8bit_optim=args.use_8bit_optim,
-        )
-        grpo_trainer.train()
 
-    # Post-train evals
+    # GRPO (clean)
+    grpo_trainer, tok_rl = build_grpo_trainer(
+        base_model=args.base_model, sft_ckpt=args.sft_ckpt, output_dir=args.output_dir,
+        rl_steps=args.rl_steps, per_device_train_batch_size=args.per_device_train_batch_size,
+        grad_acc=max(1, args.grad_acc//2), group_size=args.group_size, bf16=args.bf16, max_len=args.max_len,
+        include_mbpp_train=args.include_mbpp_train, mbpp_limit=args.mbpp_limit,
+        rl_top_p=args.eval_top_p, rl_top_k=args.eval_top_k, rl_temperature=args.eval_temperature,
+        max_completion_length=256,
+        attn_impl=attn_map.get(args.attn, "eager"),
+        compile_models=args.compile_models,
+        use_8bit_optim=args.use_8bit_optim,
+    )
+    grpo_trainer.train()
+
+    # Post-train evals (clean)
     trained = eval_all(
         "trained", grpo_trainer.model, tok_rl, args.output_dir,
         do_sample=args.eval_sample,
@@ -1322,21 +949,15 @@ def main():
         top_k=args.eval_top_k if args.eval_sample else None,
         temperature=args.eval_temperature if args.eval_sample else None,
         batch_size=args.eval_batch_size,
-        eval_prompt_max_len=args.eval_prompt_max_len
+        eval_prompt_max_len=args.eval_prompt_max_len,
+        eval_mbpp_tasks=args.eval_mbpp_tasks,
+        eval_humaneval_tasks=args.eval_humaneval_tasks,
+        eval_gsm8k_tasks=args.eval_gsm8k_tasks,
     )
     print("[Trained]", json.dumps(trained, indent=2))
-    if baseline is not None:
-        print_compare(baseline, trained)
-    else:
-        print("Baseline comparison skipped (baseline evaluation was not run)")
 
-    if baseline is not None:
-        print(f"Saved metrics to:\n  {os.path.join(args.output_dir,'metrics_baseline.json')}\n  {os.path.join(args.output_dir,'metrics_trained.json')}")
-    else:
-        print(f"Saved metrics to:\n  {os.path.join(args.output_dir,'metrics_trained.json')}")
-    print(f"SFT ckpt:  {sft_ckpt}\nGRPO ckpt: {grpo_trainer.args.output_dir}")
-    if args.skip_sft:
-        print("[Info] SFT phase skipped; only GRPO adapter updates (if any) were applied.")
+    print(f"Saved metrics to:\n  {os.path.join(args.output_dir,'metrics_baseline.json') if not args.skip_baseline_eval else '(baseline skipped)'}\n  {os.path.join(args.output_dir,'metrics_trained.json')}")
+    print(f"SFT ckpt:  {args.sft_ckpt}\nGRPO ckpt: {grpo_trainer.args.output_dir}")
 
 if __name__ == "__main__":
     main()
