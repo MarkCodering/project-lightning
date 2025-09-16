@@ -594,7 +594,7 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
                              bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         quantization_config=bnb,
         device_map="auto",
         trust_remote_code=True,
@@ -833,7 +833,7 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
                              bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
     base_model_for_rl = AutoModelForCausalLM.from_pretrained(
         base_model,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         quantization_config=bnb,
         device_map="auto",
         trust_remote_code=True,
