@@ -68,6 +68,9 @@ def equal_numeric(a: str, b: str, tol=1e-6) -> bool:
 
     def parse_num(s):
         s = s.strip()
+        # normalize common formatting
+        s = s.replace(",", "")
+        s = re.sub(r"^[\$£€]", "", s)
         if "/" in s and not re.match(r"^-?\d+\.\d+$", s):
             try:
                 n, d = s.split("/")
@@ -83,11 +86,60 @@ def equal_numeric(a: str, b: str, tol=1e-6) -> bool:
     return (ax is not None and bx is not None and abs(ax - bx) <= tol)
 
 def parse_final_from_completion(txt: str) -> str:
+    # 1) Preferred: explicit XML tag
     m = re.search(r"<answer>\s*(.*?)</answer>", txt, re.S | re.I)
     if m:
         return _norm(m.group(1))
+
+    # 2) Heuristics: look for common phrases near the final value
+    patterns = [
+        r"final\s+answer\s*[:\-]?\s*([-+]?\d*\.?\d+(?:/\d+)?)",
+        r"answer\s+is\s*[:\-]?\s*([-+]?\d*\.?\d+(?:/\d+)?)",
+        r"therefore[,\s]+the\s+answer\s+is\s*[:\-]?\s*([-+]?\d*\.?\d+(?:/\d+)?)",
+        r"result\s+is\s*[:\-]?\s*([-+]?\d*\.?\d+(?:/\d+)?)",
+        r"so\s+the\s+answer\s+is\s*[:\-]?\s*([-+]?\d*\.?\d+(?:/\d+)?)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, txt, re.I)
+        if m:
+            return _norm(m.group(1))
+
+    # 3) Otherwise: prefer a number on the last non-empty line
+    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+    if lines:
+        tail_nums = re.findall(r"[-+]?\d*\.?\d+(?:/\d+)?", lines[-1])
+        if tail_nums:
+            return _norm(tail_nums[-1])
+
+    # 4) Fallback: last numeric token anywhere
     tail = re.findall(r"[-+]?\d*\.?\d+(?:/\d+)?", txt)
     return _norm(tail[-1]) if tail else _norm(txt[-64:])
+
+def extract_code_from_text(txt: str) -> str:
+    """Extract executable Python code from free-form model output.
+
+    Priority:
+    1) fenced ```python ... ```
+    2) fenced ``` ... ```
+    3) from the first 'def ' / 'class ' / 'import ' until end
+    4) otherwise return the original text
+    """
+    m = re.search(r"```python\s*(.*?)```", txt, re.S | re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"```\s*(.*?)```", txt, re.S)
+    if m:
+        return m.group(1)
+    # find first plausible code start
+    idx = -1
+    for kw in ["\ndef ", "\ndef ", "\nclass ", "\nimport ", "\nfrom "]:
+        p = txt.find(kw)
+        if p != -1:
+            idx = p + 1  # drop the leading newline
+            break
+    if idx != -1:
+        return txt[idx:]
+    return txt
 
 # ---------------------- stopping criteria -------------------------
 
@@ -139,6 +191,30 @@ def t_math(thought: str, final: str) -> str:
 
 def p_code(desc: str) -> str:
     return f"{CODE_SYS}\n\nProblem:\n{desc.strip()}\n\nWrite the solution."
+
+def render_math_prompt(tok, q: str) -> str:
+    msg = [
+        {"role":"system","content": MATH_SYS},
+        {"role":"user","content": q.strip()},
+    ]
+    if hasattr(tok, "apply_chat_template"):
+        try:
+            return tok.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            pass
+    return p_math(q)
+
+def render_code_prompt(tok, desc: str) -> str:
+    msg = [
+        {"role":"system","content": CODE_SYS},
+        {"role":"user","content": desc.strip()},
+    ]
+    if hasattr(tok, "apply_chat_template"):
+        try:
+            return tok.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            pass
+    return p_code(desc)
 
 # ---------------------- dataset loaders (CLEAN) --------------------
 
@@ -322,6 +398,26 @@ def encode_prompts(tok, prompts: List[str], device, max_len_prompt: int):
     max_len = max_len_prompt if not finitemax_len(tok_max) else min(tok_max, max_len_prompt)
     return tok(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_len).to(device)
 
+def decode_new_completions(tok, outputs: torch.Tensor, inputs: dict) -> List[str]:
+    """Decode only the newly generated tokens per sample.
+
+    Using string slicing on decoded sequences is brittle due to tokenizer
+    normalization. Instead, compute per-sample input lengths from the
+    attention mask and slice in token space.
+    """
+    seqs = []
+    input_ids = inputs.get("input_ids")
+    if input_ids is None:
+        # Fallback: decode full sequences
+        return tok.batch_decode(outputs, skip_special_tokens=True)
+    # When batching with padding (left or right), generate appends new tokens
+    # after the common input length (= input_ids.shape[1])
+    common_len = input_ids.shape[1]
+    for i in range(outputs.size(0)):
+        new_ids = outputs[i, common_len:]
+        seqs.append(tok.decode(new_ids, skip_special_tokens=True))
+    return seqs
+
 # ------------------------- EVALS (CLEAN) --------------------------
 
 @torch.inference_mode()
@@ -340,17 +436,23 @@ def eval_gsm8k(model, tok, n=100, max_new_tokens=256,
     start_t = time.time()
     pbar = tqdm(total=total, desc="GSM8K eval", dynamic_ncols=True, smoothing=0.1)
 
+    debug = os.environ.get("DEBUG_EVAL", "0") in ("1","true","True")
+    printed = 0
+
     for i in range(0, total, batch_size):
         batch_q = questions[i:i+batch_size]
         batch_final = finals[i:i+batch_size]
-        prompts = [p_math(q) for q in batch_q]
+        prompts = [render_math_prompt(tok, q) for q in batch_q]
         inputs = encode_prompts(tok, prompts, device, max_len_prompt=eval_prompt_max_len)
         out = model.generate(**inputs, generation_config=gen_cfg, max_new_tokens=max_new_tokens, stopping_criteria=stop_crit)
-        decoded = tok.batch_decode(out, skip_special_tokens=True)
-        for j, full in enumerate(decoded):
-            pred = parse_final_from_completion(full[len(prompts[j]):])
+        decoded_new = decode_new_completions(tok, out, inputs)
+        for j, txt in enumerate(decoded_new):
+            pred = parse_final_from_completion(txt)
             if equal_numeric(pred, batch_final[j]):
                 correct += 1
+            if debug and printed < 5:
+                print(f"[GSM8K dbg] q={_norm(batch_q[j])[:80]}... pred='{pred}' gold='{batch_final[j]}' raw_tail='{_norm(txt[-80:])}'")
+                printed += 1
         done = min(i+batch_size, total)
         elapsed = max(time.time() - start_t, 1e-6)
         pbar.update(len(prompts))
@@ -359,7 +461,7 @@ def eval_gsm8k(model, tok, n=100, max_new_tokens=256,
     return correct / total
 
 @torch.inference_mode()
-def eval_mbpp(model, tok, n=50, max_new_tokens=200,
+def eval_mbpp(model, tok, n=50, max_new_tokens=350,
               do_sample=False, top_p=None, top_k=None, temperature=None,
               batch_size: int = 4, eval_prompt_max_len: int = 1536):
     ds = load_mbpp_test(n)
@@ -374,16 +476,20 @@ def eval_mbpp(model, tok, n=50, max_new_tokens=200,
     start_t = time.time()
     pbar = tqdm(total=total, desc="MBPP eval", dynamic_ncols=True, smoothing=0.1)
 
+    # Optional env override for generation length
+    try:
+        max_new_tokens = int(os.environ.get("EVAL_MBPP_MAX_NEW_TOKENS", max_new_tokens))
+    except Exception:
+        pass
+
     for i in range(0, total, batch_size):
         batch_desc = descs[i:i+batch_size]
-        prompts = [p_code(d) for d in batch_desc]
+        prompts = [render_code_prompt(tok, d) for d in batch_desc]
         inputs = encode_prompts(tok, prompts, device, max_len_prompt=eval_prompt_max_len)
         out = model.generate(**inputs, generation_config=gen_cfg, max_new_tokens=max_new_tokens, stopping_criteria=stop_crit)
-        decoded = tok.batch_decode(out, skip_special_tokens=True)
-        for j, full in enumerate(decoded):
-            txt = full[len(prompts[j]):]
-            m = re.search(r"```(?:python)?\s*(.*?)```", txt, re.S|re.I)
-            code = m.group(1) if m else txt
+        decoded_new = decode_new_completions(tok, out, inputs)
+        for j, txt in enumerate(decoded_new):
+            code = extract_code_from_text(txt)
             ok, _ = run_code_and_tests(code, setups[i+j], tests[i+j])
             if ok:
                 passed += 1
@@ -411,14 +517,12 @@ def eval_humaneval(model, tok, n=30, max_new_tokens=200,
 
     for i in range(0, total, batch_size):
         batch_prompt = prompts_raw[i:i+batch_size]
-        prompts = [p_code(p) for p in batch_prompt]
+        prompts = [render_code_prompt(tok, p) for p in batch_prompt]
         inputs = encode_prompts(tok, prompts, device, max_len_prompt=eval_prompt_max_len)
         out = model.generate(**inputs, generation_config=gen_cfg, max_new_tokens=max_new_tokens, stopping_criteria=stop_crit)
-        decoded = tok.batch_decode(out, skip_special_tokens=True)
-        for j, full in enumerate(decoded):
-            txt = full[len(prompts[j]):]
-            m = re.search(r"```(?:python)?\s*(.*?)```", txt, re.S|re.I)
-            code = m.group(1) if m else txt
+        decoded_new = decode_new_completions(tok, out, inputs)
+        for j, txt in enumerate(decoded_new):
+            code = extract_code_from_text(txt)
             ok, _ = run_code_and_tests(code, "", [tests_raw[i+j]])
             if ok:
                 passed += 1
