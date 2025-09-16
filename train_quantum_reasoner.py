@@ -495,113 +495,242 @@ def forcebf16(module: nn.Module):
     if changed:
         print(f"[dtype] Forced {changed} tensors to bfloat16 for consistency.")
 
+# -------------------- Gradient norm recorder ----------------------
+
+class GradNormRecorder:
+    def __init__(self):
+        self.accum_sq = 0.0
+        self.last = 0.0
+        self._hooks = []
+        self.calls = 0
+        self.hooked_params = 0
+
+    def _hook(self, grad: torch.Tensor):
+        try:
+            # Use float32 for accumulation stability; grad may be bf16
+            self.accum_sq += float(grad.detach().to(torch.float32).pow(2).sum().item())
+            self.calls += 1
+        except Exception:
+            pass
+        return grad
+
+    def register(self, model: nn.Module):
+        # register on all trainable parameters
+        for p in model.parameters():
+            if p.requires_grad:
+                try:
+                    h = p.register_hook(self._hook)
+                    self._hooks.append(h)
+                    self.hooked_params += 1
+                except Exception:
+                    continue
+    def register_from_optimizer(self, optimizer):
+        try:
+            for group in getattr(optimizer, 'param_groups', []):
+                for p in group.get('params', []):
+                    if isinstance(p, torch.Tensor) and hasattr(p, 'register_hook'):
+                        try:
+                            h = p.register_hook(self._hook)
+                            self._hooks.append(h)
+                            self.hooked_params += 1
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+
+    def pop(self) -> float:
+        val = (self.accum_sq ** 0.5) if self.accum_sq > 0 else 0.0
+        self.last = val
+        self.accum_sq = 0.0
+        self.calls = 0
+        return val
+
+    def peek(self) -> float:
+        if self.accum_sq > 0:
+            return (self.accum_sq ** 0.5)
+        return self.last
+
 # -------------------- SFT builder (CLEAN) -------------------------
 
 class GradNormOverrideCallback(TrainerCallback):
     """Override HF's default grad_norm=0.0 with our computed value."""
     def __init__(self):
         self.last_grad_norm = 0.0
-        self.step_count = 0
     
-    def on_backward_end(self, args, state, control, **kwargs):
-        # Capture gradient norm immediately after backward pass
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        # Compute gradient norm at log time when we know trainer has run backward
+        if logs is None:
+            return
+
+        # Prefer the model passed in kwargs to avoid attribute access issues
         model = kwargs.get("model")
-        trainer = kwargs.get("trainer")
         if model is None:
-            model = trainer.model if trainer else None
+            trainer = kwargs.get("trainer")
+            model = getattr(trainer, "model", None) if trainer is not None else None
         if model is None:
             return
             
-        total_sq = 0.0
-        counted = 0
-        for name, p in model.named_parameters():
-            if p.grad is not None and torch.is_floating_point(p.grad):
-                g = p.grad.data
-                total_sq += float(g.norm(2) ** 2)
-                counted += 1
-        
-        if counted > 0:
-            self.last_grad_norm = total_sq ** 0.5
-            self.step_count += 1
-            # Print every few steps to avoid spam
-            if self.step_count % 5 == 0:
-                print(f"[RealGradNorm] step={state.global_step} grad_norm={self.last_grad_norm:.4f} params_with_grad={counted}")
-    
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        # Override the logged grad_norm with our real value
-        if logs is not None and self.last_grad_norm > 0:
+        # Try recorder first
+        rec: GradNormRecorder = getattr(model, "_grad_recorder", None)
+        if rec is not None:
+            gn = float(rec.peek())
+        else:
+            total_sq = 0.0
+            counted = 0
+            for name, p in model.named_parameters():
+                if p.grad is not None and torch.is_floating_point(p.grad):
+                    g = p.grad.data
+                    total_sq += float(g.norm(2) ** 2)
+                    counted += 1
+            gn = (total_sq ** 0.5) if counted > 0 else 0.0
+
+        if gn <= 0:
+            prev = getattr(model, "_last_grad_norm", None)
+            if prev is not None:
+                gn = float(prev)
+        if gn > 0:
+            self.last_grad_norm = gn
             logs["grad_norm"] = self.last_grad_norm
 
+    def on_train_begin(self, args, state, control, **kwargs):
+        model = kwargs.get("model")
+        trainer = kwargs.get("trainer")
+        if model is None and trainer is not None:
+            model = getattr(trainer, "model", None)
+        if model is None:
+            return
+        # Attach recorder after model is fully prepared/wrapped by accelerate
+        if getattr(model, "_grad_recorder", None) is None:
+            try:
+                rec = GradNormRecorder()
+                rec.register(model)
+                # If nothing was hooked yet, try optimizer params too
+                if getattr(rec, 'hooked_params', 0) == 0 and trainer is not None:
+                    opt = getattr(trainer, 'optimizer', None)
+                    if opt is not None:
+                        rec.register_from_optimizer(opt)
+                setattr(model, "_grad_recorder", rec)
+                print(f"[Grad] Recorder hooks registered (on_train_begin). hooked_params={rec.hooked_params}")
+            except Exception as e:
+                print(f"[Grad] Recorder registration failed (on_train_begin): {e}")
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        # Fallback: if recorder present but not hooked, try optimizer now
+        model = kwargs.get("model")
+        trainer = kwargs.get("trainer")
+        if model is None:
+            return
+        rec = getattr(model, "_grad_recorder", None)
+        if rec is not None and getattr(rec, 'hooked_params', 0) == 0 and trainer is not None:
+            try:
+                opt = getattr(trainer, 'optimizer', None)
+                if opt is not None:
+                    rec.register_from_optimizer(opt)
+                    print(f"[Grad] Recorder late-registered on optimizer params. hooked_params={rec.hooked_params}")
+            except Exception:
+                pass
+
 class GradNormCallback(TrainerCallback):
-    def on_backward_end(self, args, state, control, **kwargs):
+    def on_step_end(self, args, state, control, **kwargs):
         model = kwargs.get("model")
         trainer = kwargs.get("trainer")
         if model is None:
             return
-        # Micro-step grad norm (before optimizer step)
-        total_sq = 0.0
-        counted = 0
-        for p in model.parameters():
-            if p.grad is not None and torch.is_floating_point(p.grad):
-                g = p.grad.data
-                total_sq += float(g.norm(2) ** 2)
-                counted += 1
-        if counted > 0:
-            gn = total_sq ** 0.5
-            if trainer is not None:
-                trainer.log({"micro_grad_norm": gn})
-            try:
-                from tqdm.auto import tqdm as _tqdm
-                _tqdm.write(f"[GradNorm] step={state.global_step} micro_grad_norm={gn:.4f}")
-            except Exception:
-                print(f"[GradNorm] step={state.global_step} micro_grad_norm={gn:.4f}")
-    def on_optimizer_step(self, args, state, control, **kwargs):
-        model = kwargs.get("model")
-        trainer = kwargs.get("trainer")
-        if model is None:
-            return
+        # Prefer recorder if available (captures grads before zeroing), snapshot at step end
+        rec: GradNormRecorder = getattr(model, "_grad_recorder", None)
+        if rec is not None:
+            gn = float(rec.pop())
+        else:
+            total_sq = 0.0
+            counted = 0
+            for p in model.parameters():
+                if p.grad is not None and torch.is_floating_point(p.grad):
+                    g = p.grad.data
+                    total_sq += float(g.norm(2) ** 2)
+                    counted += 1
+            gn = (total_sq ** 0.5) if counted > 0 else 0.0
+        # Optional: clip gradients to configured max_grad_norm for stability
         try:
-            log_every = max(1, getattr(args, "logging_steps", 5))
-            if state.global_step % log_every != 0:
-                return
+            max_gn = getattr(args, 'max_grad_norm', 1.0)
+            if isinstance(max_gn, (int, float)) and max_gn > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_gn)
         except Exception:
-            log_every = 5
-            if state.global_step % log_every != 0:
-                return
-        total_sq = 0.0
-        counted = 0
-        for name, p in model.named_parameters():
-            if p.grad is not None and torch.is_floating_point(p.grad):
-                g = p.grad.data
-                total_sq += float(g.norm(2) ** 2)
-                counted += 1
-        if counted > 0:
-            gn = total_sq ** 0.5
-            if trainer is not None:
-                trainer.log({"grad_norm": gn})
+            pass
+
+        try:
+            setattr(model, "_last_grad_norm", float(gn))
+        except Exception:
+            pass
+
+        # One-time diagnostics at first step
+        try:
+            if int(state.global_step) == 1 and trainer is not None:
+                rec = getattr(model, "_grad_recorder", None)
+                opt = getattr(trainer, 'optimizer', None)
+                n_groups = len(opt.param_groups) if opt is not None else 0
+                trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                has_grad = sum(p.numel() for p in model.parameters() if getattr(p, 'grad', None) is not None)
+                # labels coverage (if batch still available via trainer)
+                label_cov = None
+                try:
+                    last_inputs = getattr(trainer, 'current_flos', None)  # placeholder; real inputs not available
+                except Exception:
+                    last_inputs = None
+                print(f"[Diag] step=1 hooked_params={getattr(rec,'hooked_params',0)} hook_calls={getattr(rec,'calls',0)} trainable={trainable} has_grad={has_grad} opt_groups={n_groups}")
+        except Exception:
+            pass
+        if trainer is not None:
+            # Only log on configured logging steps to avoid spam
             try:
-                from tqdm.auto import tqdm as _tqdm
-                _tqdm.write(f"[GradNorm] step={state.global_step} grad_norm={gn:.4f}")
+                log_every = max(1, getattr(args, "logging_steps", 5))
+                first = bool(getattr(args, "logging_first_step", False))
             except Exception:
-                print(f"[GradNorm] step={state.global_step} grad_norm={gn:.4f}")
+                log_every = 5
+                first = False
+            if state.global_step == 1 and first:
+                trainer.log({"micro_grad_norm": gn, "grad_norm": gn})
+            elif state.global_step % log_every == 0:
+                trainer.log({"micro_grad_norm": gn, "grad_norm": gn})
+        try:
+            from tqdm.auto import tqdm as _tqdm
+            rec = getattr(model, "_grad_recorder", None)
+            rc = getattr(rec, 'calls', 0) if rec is not None else 0
+            hp = getattr(rec, 'hooked_params', 0) if rec is not None else 0
+            _tqdm.write(f"[GradNorm] step={state.global_step} micro_grad_norm={gn:.4f} (hook_calls={rc} hooked_params={hp})")
+        except Exception:
+            print(f"[GradNorm] step={state.global_step} micro_grad_norm={gn:.4f}")
 
 def pretokenize_for_sft(raw_ds: Dataset, tok: "AutoTokenizer", max_len: int) -> Dataset:
-    def to_text(batch):
-        texts = [f"{p}\n\n{t}" for p, t in zip(batch["prompt"], batch["target"])]
-        return {"text": texts}
-    ds_text = raw_ds.map(to_text, batched=True,
-                         remove_columns=[c for c in raw_ds.column_names if c not in []])
     tok.model_max_length = max_len
-    if tok.pad_token is None: tok.pad_token = tok.eos_token
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
     tok.padding_side = "right"
 
-    def tok_map(batch):
-        enc = tok(batch["text"], truncation=True, max_length=max_len, padding=False)
-        labels = [ids.copy() for ids in enc["input_ids"]]
-        enc["labels"] = labels
-        return enc
+    def encode_example(ex):
+        p = ex["prompt"]
+        t = ex["target"]
+        p_ids = tok(p, add_special_tokens=False)["input_ids"]
+        t_ids = tok(t, add_special_tokens=False)["input_ids"]
+        eos = [tok.eos_token_id] if tok.eos_token_id is not None else []
 
-    ds_tok = ds_text.map(tok_map, batched=True, remove_columns=["text"])
+        # Ensure target fits; prioritize keeping target tokens
+        max_target = max_len - 1 if eos else max_len
+        if len(t_ids) > max_target:
+            t_ids = t_ids[:max_target]
+        # Remaining for prompt after reserving target + eos
+        remain = max_len - len(t_ids) - len(eos)
+        if remain < 0:
+            remain = 0
+        if len(p_ids) > remain:
+            # Keep the last tokens of prompt to preserve task end context
+            p_ids = p_ids[-remain:] if remain > 0 else []
+
+        input_ids = p_ids + t_ids + eos
+        labels = ([-100] * len(p_ids)) + t_ids + eos
+        attention_mask = [1] * len(input_ids)
+        return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
+
+    ds_tok = raw_ds.map(encode_example, remove_columns=[c for c in raw_ds.column_names if c not in ["prompt","target"]])
     ds_tok.set_format(type="torch")
     return ds_tok
 
@@ -650,7 +779,7 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
             output.requires_grad_(True)
         model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-    # Fix 2: prepare for k-bit training BEFORE LoRA wrapping
+    # Fix 2: prepare for k-bit training BEFORE LoRA; let TRL inject LoRA via peft_config
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=not disable_sft_gc)
 
     targets = find_lora_targets(model)
@@ -659,9 +788,7 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
         r=16, lora_alpha=32, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM",
         target_modules=targets
     )
-    model = get_peft_model(model, lora)
-    print_trainable_params(model)
-    # Reinforce after PEFT wrap: some wrappers toggle this back on
+    # Do NOT wrap here; pass peft_config to SFTTrainer to ensure optimizer picks LoRA params
     try:
         model.config.use_cache = False
     except Exception:
@@ -689,8 +816,9 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
     args = SFTConfig(
         output_dir=os.path.join(output_dir, "sft"),
         max_steps=sft_steps,
-        learning_rate=lr,                          # safer default than 2e-5
-        warmup_steps=max(10, sft_steps // 20),     # shorter warmup for faster ramp
+        learning_rate=min(lr, 1.5e-5),             # reduce LR a bit for stability
+        warmup_steps=max(20, int(0.03 * sft_steps)),  # more warmup for stability
+        warmup_ratio=0.0,                          # disable ratio-based warmup
         lr_scheduler_type="cosine",
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=grad_acc,
@@ -712,10 +840,34 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
 
     trainer = SFTTrainer(
         model=model, args=args, train_dataset=train_ds,
-        data_collator=collator, peft_config=None,
+        data_collator=collator, peft_config=lora,
     )
-    trainer.add_callback(GradNormOverrideCallback())
+    
+    # Debug: print optimizer param groups and initial learning rates
+    def print_optimizer_lr(trainer):
+        opt = getattr(trainer, 'optimizer', None)
+        if opt is not None:
+            for i, group in enumerate(opt.param_groups):
+                print(f"[DEBUG] Optimizer group {i} lr={group['lr']}")
+    print_optimizer_lr(trainer)
+    try:
+        print_trainable_params(trainer.model)
+    except Exception:
+        pass
 
+    # Recorder hooks will be attached on on_train_begin after Accelerate wraps the model
+
+    # Force initial LR to be nonzero for all param groups
+    opt = getattr(trainer, 'optimizer', None)
+    if opt is not None:
+        for group in opt.param_groups:
+            if group['lr'] == 0.0:
+                group['lr'] = args.learning_rate if hasattr(args, 'learning_rate') else 2e-5
+                print(f"[FIX] Set optimizer group lr to {group['lr']}")
+    
+    trainer.add_callback(GradNormOverrideCallback())
+    trainer.add_callback(GradNormCallback())
+    
     if compile_models:
         # Advice: leave this OFF for SFT unless you've verified stability.
         try:

@@ -1,3 +1,5 @@
 /runs/*/sft
 /runs/*/grpo
 /venv
+
+__pycache__/
