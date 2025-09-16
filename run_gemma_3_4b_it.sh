@@ -7,8 +7,8 @@
 set -euo pipefail
 
 ### ---------- knobs you might tweak ----------
-BASE_MODEL="google/gemma-3-4b-it"
-OUTDIR="./runs/gemma3-clean"
+BASE_MODEL="microsoft/Phi-4-mini-reasoning"
+OUTDIR="./runs/phi4-reasoning-mini-qrl"
 SFT_STEPS=300
 RL_STEPS=300
 
