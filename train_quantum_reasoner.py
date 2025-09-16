@@ -633,7 +633,7 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
     # remove 'final' if present (not needed for RL reward below)
     if "final" in mt.column_names:
         mt = mt.remove_columns(["final"])
-    math_train = mt.map(lambda ex: {"task":"math"})
+    math_train = mt.map(lambda ex: {"prompt": ex["prompt"], "target": ex["target"], "targets": ex["target"], "task": "math"})
 
     code_train = None
     if include_mbpp_train:
@@ -654,6 +654,9 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
 
     # Reward functions (no test-set leakage)
     def reward_math(prompts=None, completions=None, targets=None, **kwargs):
+        # If targets are missing, provide neutral (0.0) rewards to avoid crashes.
+        if targets is None or any(t is None for t in targets):
+            return [0.0 for _ in (completions or [])]
         return reward_quantum_process(
             completions=completions,
             targets=targets,
@@ -675,13 +678,46 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
             rewards.append(float(score))
         return rewards
 
-    def mixed_reward(prompts=None, completions=None, task=None, **kw):
+    def mixed_reward(prompts=None, completions=None, targets=None, task=None, **kw):
+        """Route rewards per task.
+
+        The TRL GRPOTrainer may pass either `target` or `targets` (or neither) depending
+        on dataset column names. We make this robust:
+        - Accept both plural and singular via **kw fallback.
+        - If no targets available for math samples, return a small neutral reward (0.0).
+        """
+        # Fallback: some pipelines pass singular 'target'
+        if targets is None:
+            single_target = kw.get("target")
+            if single_target is not None:
+                # Broadcast single target to match completions length if needed
+                if isinstance(single_target, list):
+                    targets = single_target
+                else:
+                    targets = [single_target] * len(completions if completions else [])
+
         out = []
-        for i,t in enumerate(task):
+        for i, t in enumerate(task or []):
             if t == "math":
-                out.extend(reward_math(prompts=[prompts[i]], completions=[completions[i]]))
+                has_targets = targets is not None and i < len(targets) and targets[i] is not None
+                if has_targets:
+                    out.extend(
+                        reward_math(
+                            prompts=[prompts[i]],
+                            completions=[completions[i]],
+                            targets=[targets[i]],
+                        )
+                    )
+                else:
+                    # Neutral reward if no target to compare reasoning against
+                    out.append(0.0)
             else:
-                out.extend(reward_code(prompts=[prompts[i]], completions=[completions[i]]))
+                out.extend(
+                    reward_code(
+                        prompts=[prompts[i]],
+                        completions=[completions[i]],
+                    )
+                )
         return out
 
     generation_kwargs = {
