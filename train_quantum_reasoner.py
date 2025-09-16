@@ -580,6 +580,7 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
                       sft_mbpp_limit: Optional[int] = None,
                       sft_humaneval_limit: Optional[int] = None,
                       flash_attn: bool = False,
+                      attn_impl_override: Optional[str] = None,
                       compile_models: bool = False,
                       disable_sft_gc: bool = False,
                       use_8bit_optim: bool = False,
@@ -589,7 +590,7 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
     tok.padding_side = "right"
     tok.model_max_length = max_len
 
-    attn_impl = "flash_attention_2" if flash_attn else "eager"
+    attn_impl = attn_impl_override or ("flash_attention_2" if flash_attn else "eager")
     bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
                              bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -822,13 +823,14 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
                        rl_mbpp_limit: Optional[int] = None,
                        rl_humaneval_limit: Optional[int] = None,
                        flash_attn: bool = False,
+                       attn_impl_override: Optional[str] = None,
                        compile_models: bool = False,
                        use_8bit_optim: bool = False):
     tok = AutoTokenizer.from_pretrained(base_model, use_fast=True, trust_remote_code=True)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
     tok.padding_side = "right"
 
-    attn_impl = "flash_attention_2" if flash_attn else "eager"
+    attn_impl = attn_impl_override or ("flash_attention_2" if flash_attn else "eager")
     bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
                              bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
     base_model_for_rl = AutoModelForCausalLM.from_pretrained(
@@ -1140,6 +1142,9 @@ def main():
     ap.add_argument("--disable_qk_prm", dest="enable_qk_prm", action="store_false", help="Disable Quantum Kernel PRM.")
     ap.set_defaults(enable_qk_prm=True)
     ap.add_argument("--prm_weight", type=float, default=0.3)
+    # Attention backend control (no external deps by default)
+    ap.add_argument("--attn", type=str, choices=["eager", "sdpa", "flash"], default="eager",
+                    help="Attention backend: eager (default), sdpa (PyTorch), or flash (requires flash-attn)")
 
     # RL sampling
     ap.add_argument("--rl_top_p", type=float, default=0.9)
@@ -1174,6 +1179,8 @@ def main():
 
     args = ap.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+    # Map --attn to HF attn_implementation values (ensure available everywhere)
+    attn_map = {"eager": "eager", "sdpa": "sdpa", "flash": "flash_attention_2"}
 
     baseline = None
     if not args.skip_baseline_eval:
@@ -1194,7 +1201,7 @@ def main():
             quantization_config=bnb0,
             device_map="auto",
             trust_remote_code=True,
-            attn_implementation="eager",
+            attn_implementation=attn_map.get(args.attn, "eager"),
         )
         _force_bf16(base)
         base.config.use_cache = False
@@ -1239,6 +1246,7 @@ def main():
             sft_mbpp_limit=args.sft_mbpp_limit,
             sft_humaneval_limit=args.sft_humaneval_limit,
             flash_attn=args.flash_attn,
+            attn_impl_override=attn_map.get(args.attn, "eager"),
             compile_models=args.compile_models,
             disable_sft_gc=args.disable_sft_gc,
             use_8bit_optim=args.use_8bit_optim,
@@ -1259,7 +1267,7 @@ def main():
                                       bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
         base_eval = AutoModelForCausalLM.from_pretrained(
             args.base_model, torch_dtype=torch.bfloat16, quantization_config=bnb_eval,
-            device_map="auto", trust_remote_code=True, attn_implementation="eager"
+            device_map="auto", trust_remote_code=True, attn_implementation=attn_map.get(args.attn, "eager")
         )
         _force_bf16(base_eval)
         if os.path.isdir(adapter_path):
@@ -1300,6 +1308,7 @@ def main():
             rl_mbpp_limit=args.rl_mbpp_limit,
             rl_humaneval_limit=args.rl_humaneval_limit,
             flash_attn=args.flash_attn,
+            attn_impl_override=attn_map.get(args.attn, "eager"),
             compile_models=args.compile_models,
             use_8bit_optim=args.use_8bit_optim,
         )
