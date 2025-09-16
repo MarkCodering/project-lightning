@@ -729,8 +729,13 @@ def pretokenize_for_sft(raw_ds: Dataset, tok: "AutoTokenizer", max_len: int) -> 
             p_ids = p_ids[0]
         if isinstance(f_ids, list) and len(f_ids) > 0 and isinstance(f_ids[0], list):
             f_ids = f_ids[0]
-        # Target portion is the tail after the prompt portion
-        t_ids = f_ids[len(p_ids):]
+        # Find robust prompt boundary via longest common prefix
+        lcp = 0
+        for a, b in zip(p_ids, f_ids):
+            if a == b:
+                lcp += 1
+            else:
+                break
 
         # Truncate from the left to fit max_len, preferring to keep target
         if len(f_ids) > max_len:
@@ -738,9 +743,9 @@ def pretokenize_for_sft(raw_ds: Dataset, tok: "AutoTokenizer", max_len: int) -> 
             drop = len(f_ids) - max_len
             f_ids = f_ids[drop:]
             # Prompt kept length adjusts accordingly
-            kept_p = max(0, len(p_ids) - drop)
+            kept_p = max(0, lcp - drop)
         else:
-            kept_p = len(p_ids)
+            kept_p = lcp
         # After truncation, labels are -100 for kept prompt tokens, then actual ids for the rest
         input_ids = f_ids
         labels = ([-100] * kept_p) + f_ids[kept_p:]
@@ -794,6 +799,37 @@ class DataCollatorKeepLabels:
             labels[i, :L] = torch.tensor(li[:L], dtype=torch.long)
         batch["labels"] = labels
         return batch
+
+def sft_dataset_sanity(ds: Dataset, tok: "AutoTokenizer", sample_n: int = 256):
+    try:
+        n = min(sample_n, len(ds))
+        sup_lens = []
+        bad_range = 0
+        voc = tok.vocab_size if hasattr(tok, 'vocab_size') else None
+        zero_sup = 0
+        for i in range(n):
+            ex = ds[i]
+            labels = ex["labels"].tolist() if isinstance(ex["labels"], torch.Tensor) else ex["labels"]
+            L = len(labels)
+            s = sum(1 for v in labels if v != -100)
+            sup_lens.append(s)
+            if s == 0:
+                zero_sup += 1
+            if voc is not None:
+                for v in labels:
+                    if v != -100 and (v < 0 or v >= voc):
+                        bad_range += 1
+                        break
+        if sup_lens:
+            import statistics as st
+            avg = st.mean(sup_lens)
+            p50 = st.median(sup_lens)
+            p90 = sorted(sup_lens)[int(0.9*len(sup_lens))-1]
+            print(f"[SFT Sanity] n={n} avg_supervised_tokens={avg:.1f} p50={p50} p90={p90} zero_supervised={zero_sup}")
+            if tok and hasattr(tok, 'vocab_size'):
+                print(f"[SFT Sanity] tokenizer.vocab_size={tok.vocab_size} bad_label_range_examples={bad_range}")
+    except Exception as e:
+        print(f"[SFT Sanity] Skipped sanity check: {e}")
 
 def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
                       per_device_train_batch_size=1, grad_acc=8, bf16=True, max_len=4096,
@@ -878,8 +914,8 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
     args = SFTConfig(
         output_dir=os.path.join(output_dir, "sft"),
         max_steps=sft_steps,
-    learning_rate=min(lr, 2.0e-6),             # even tighter LR cap for stability
-    warmup_steps=max(100, int(0.20 * sft_steps)),  # 20% warmup or at least 100 steps
+        learning_rate=min(lr, 2.0e-6),             # even tighter LR cap for stability
+        warmup_steps=max(100, int(0.20 * sft_steps)),  # 20% warmup or at least 100 steps
         warmup_ratio=0.0,                          # disable ratio-based warmup
         lr_scheduler_type="cosine",
         per_device_train_batch_size=per_device_train_batch_size,
@@ -896,7 +932,7 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
         optim=optim_choice,
         dataloader_num_workers=dataloader_workers,
         dataloader_pin_memory=True,
-    max_grad_norm=0.1,                         # very tight clip for early stability
+        max_grad_norm=0.1,                         # very tight clip for early stability
         weight_decay=0.0,                          # disable weight decay for LoRA
         adam_beta1=0.9,
         adam_beta2=0.95,

@@ -30,7 +30,7 @@ EVAL_GSM_TASKS=100
 # Performance toggles
 ATTN_IMPL="eager"          # eager | sdpa | flash
 USE_8BIT_OPTIM=true
-COMPILE_MODELS=false       # recommend OFF during SFT until stable
+COMPILE_MODELS=true       # recommend OFF during SFT until stable
 
 # If you want eval-only, set one of these and pass "eval-only" as the first arg
 SFT_CKPT=""                # e.g., ./runs/gemma3-clean/sft/checkpoint-300
