@@ -57,10 +57,7 @@ mkdir -p "$OUTDIR"
 COMMON_ARGS=( 
   --base_model "$BASE_MODEL"
   --output_dir "$OUTDIR"
-  --sft_steps "$SFT_STEPS"
   --rl_steps "$RL_STEPS"
-  --sft_lr_scheduler_type "cosine"
-  --sft_warmup_ratio 0.1
   --grad_acc 24
   --max_len 1536
   --attn "$ATTN_IMPL"
@@ -74,7 +71,6 @@ COMMON_ARGS=(
   --eval_gsm8k_tasks "$EVAL_GSM_TASKS"
   --use_8bit_optim
   --skip_baseline_eval
-  --skip_sft
 )
 
 # Optional toggles
