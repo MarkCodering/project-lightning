@@ -728,6 +728,90 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
 
     return trainer, tok
 
+# -------------------- Quantum Process Kernel ----------------------
+
+def get_quantum_kernel(
+    n_qubits: int,
+    n_layers: int,
+    reps: int = 2,
+    seed: int = 42,
+):
+    """
+    Creates a simulated Projected Quantum Kernel using classical PyTorch components.
+    This avoids a dependency on a full quantum SDK but mimics the structure.
+    """
+    torch.manual_seed(seed)
+
+    # Simulate a feature map: classical data -> "quantum" feature space
+    # This is a random projection, inspired by random quantum circuits.
+    feature_map = nn.Linear(n_qubits, n_qubits * reps, bias=False)
+    with torch.no_grad():
+        # Orthogonal initialization for stability, mimicking unitary operations
+        nn.init.orthogonal_(feature_map.weight)
+
+    # Simulate a measurement process
+    # In a real PQC, this would be estimating Pauli Z operators. Here, we project.
+    measurements = nn.Linear(n_qubits * reps, n_qubits, bias=False)
+    with torch.no_grad():
+        nn.init.orthogonal_(measurements.weight)
+
+    kernel = nn.Sequential(
+        feature_map,
+        nn.Tanh(), # Non-linearity to capture complex relationships
+        measurements,
+    )
+    return kernel.eval()
+
+def reward_quantum_process(
+    completions: List[str],
+    targets: List[str],
+    kernel: nn.Module,
+    tokenizer: "AutoTokenizer",
+    device: torch.device,
+    n_qubits: int,
+) -> List[float]:
+    """
+    Computes a reward based on the similarity of reasoning processes,
+    measured by a quantum-inspired kernel.
+    """
+    rewards = []
+    for comp, target in zip(completions, targets):
+        # 1. Extract reasoning process from <think> blocks
+        comp_think = re.search(r"<think>(.*?)</think>", comp, re.S)
+        target_think = re.search(r"<think>(.*?)</think>", target, re.S)
+
+        if not comp_think or not target_think:
+            rewards.append(0.0) # Penalize if the model fails to produce a thought process
+            continue
+
+        # 2. Tokenize and embed the thought processes
+        comp_text = comp_think.group(1).strip()
+        target_text = target_think.group(1).strip()
+
+        comp_ids = tokenizer(comp_text, return_tensors="pt", max_length=n_qubits, truncation=True, padding="max_length").input_ids.to(device)
+        target_ids = tokenizer(target_text, return_tensors="pt", max_length=n_qubits, truncation=True, padding="max_length").input_ids.to(device)
+
+        # 3. Project embeddings into the kernel's feature space
+        with torch.no_grad():
+            comp_proj = kernel(comp_ids.float()).squeeze()
+            target_proj = kernel(target_ids.float()).squeeze()
+
+        # 4. Compute similarity (reward) as the cosine similarity in the projected space
+        similarity = F.cosine_similarity(comp_proj, target_proj, dim=0).item()
+        
+        # 5. Add a bonus for getting the final answer correct
+        final_answer_bonus = 0.0
+        comp_ans = parse_final_from_completion(comp)
+        target_ans = parse_final_from_completion(target)
+        if equal_numeric(comp_ans, target_ans):
+            final_answer_bonus = 0.5
+
+        # The final reward is a combination of process similarity and answer correctness
+        reward = 0.5 * max(0, similarity) + final_answer_bonus
+        rewards.append(reward)
+
+    return rewards
+
 # ------------------------------ main --------------------------------
 
 def main():
@@ -889,87 +973,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# -------------------- Quantum Process Kernel ----------------------
-
-def get_quantum_kernel(
-    n_qubits: int,
-    n_layers: int,
-    reps: int = 2,
-    seed: int = 42,
-):
-    """
-    Creates a simulated Projected Quantum Kernel using classical PyTorch components.
-    This avoids a dependency on a full quantum SDK but mimics the structure.
-    """
-    torch.manual_seed(seed)
-
-    # Simulate a feature map: classical data -> "quantum" feature space
-    # This is a random projection, inspired by random quantum circuits.
-    feature_map = nn.Linear(n_qubits, n_qubits * reps, bias=False)
-    with torch.no_grad():
-        # Orthogonal initialization for stability, mimicking unitary operations
-        nn.init.orthogonal_(feature_map.weight)
-
-    # Simulate a measurement process
-    # In a real PQC, this would be estimating Pauli Z operators. Here, we project.
-    measurements = nn.Linear(n_qubits * reps, n_qubits, bias=False)
-    with torch.no_grad():
-        nn.init.orthogonal_(measurements.weight)
-
-    kernel = nn.Sequential(
-        feature_map,
-        nn.Tanh(), # Non-linearity to capture complex relationships
-        measurements,
-    )
-    return kernel.eval()
-
-def reward_quantum_process(
-    completions: List[str],
-    targets: List[str],
-    kernel: nn.Module,
-    tokenizer: "AutoTokenizer",
-    device: torch.device,
-    n_qubits: int,
-) -> List[float]:
-    """
-    Computes a reward based on the similarity of reasoning processes,
-    measured by a quantum-inspired kernel.
-    """
-    rewards = []
-    for comp, target in zip(completions, targets):
-        # 1. Extract reasoning process from <think> blocks
-        comp_think = re.search(r"<think>(.*?)</think>", comp, re.S)
-        target_think = re.search(r"<think>(.*?)</think>", target, re.S)
-
-        if not comp_think or not target_think:
-            rewards.append(0.0) # Penalize if the model fails to produce a thought process
-            continue
-
-        # 2. Tokenize and embed the thought processes
-        comp_text = comp_think.group(1).strip()
-        target_text = target_think.group(1).strip()
-
-        comp_ids = tokenizer(comp_text, return_tensors="pt", max_length=n_qubits, truncation=True, padding="max_length").input_ids.to(device)
-        target_ids = tokenizer(target_text, return_tensors="pt", max_length=n_qubits, truncation=True, padding="max_length").input_ids.to(device)
-
-        # 3. Project embeddings into the kernel's feature space
-        with torch.no_grad():
-            comp_proj = kernel(comp_ids.float()).squeeze()
-            target_proj = kernel(target_ids.float()).squeeze()
-
-        # 4. Compute similarity (reward) as the cosine similarity in the projected space
-        similarity = F.cosine_similarity(comp_proj, target_proj, dim=0).item()
-        
-        # 5. Add a bonus for getting the final answer correct
-        final_answer_bonus = 0.0
-        comp_ans = parse_final_from_completion(comp)
-        target_ans = parse_final_from_completion(target)
-        if equal_numeric(comp_ans, target_ans):
-            final_answer_bonus = 0.5
-
-        # The final reward is a combination of process similarity and answer correctness
-        reward = 0.5 * max(0, similarity) + final_answer_bonus
-        rewards.append(reward)
-
-    return rewards
