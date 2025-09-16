@@ -846,7 +846,7 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
     targets = find_lora_targets(model)
     print(f"[LoRA] target_modules={targets}")
     lora = LoraConfig(
-        r=16, lora_alpha=32, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM",
+        r=8, lora_alpha=16, lora_dropout=0.10, bias="none", task_type="CAUSAL_LM",
         target_modules=targets
     )
     # Do NOT wrap here; pass peft_config to SFTTrainer to ensure optimizer picks LoRA params
@@ -878,8 +878,8 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
     args = SFTConfig(
         output_dir=os.path.join(output_dir, "sft"),
         max_steps=sft_steps,
-        learning_rate=min(lr, 3.0e-6),             # tighter LR cap for stability
-        warmup_steps=max(100, int(0.20 * sft_steps)),  # 20% warmup or at least 100 steps
+    learning_rate=min(lr, 2.0e-6),             # even tighter LR cap for stability
+    warmup_steps=max(100, int(0.20 * sft_steps)),  # 20% warmup or at least 100 steps
         warmup_ratio=0.0,                          # disable ratio-based warmup
         lr_scheduler_type="cosine",
         per_device_train_batch_size=per_device_train_batch_size,
@@ -896,7 +896,7 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
         optim=optim_choice,
         dataloader_num_workers=dataloader_workers,
         dataloader_pin_memory=True,
-        max_grad_norm=0.2,                         # even tighter clip
+    max_grad_norm=0.1,                         # very tight clip for early stability
         weight_decay=0.0,                          # disable weight decay for LoRA
         adam_beta1=0.9,
         adam_beta2=0.95,
