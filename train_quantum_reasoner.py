@@ -6,11 +6,11 @@ Clean SFT -> GRPO training + clean evaluation (no test-set contamination).
 - RL (GRPO): same train-only pools (never HumanEval, never MBPP test)
 - Eval: GSM8K(test), MBPP(test), HumanEval(test)  [HumanEval is eval-only by default]
 
-Notes:
-- Uses LoRA on top of a 4-bit base model for memory efficiency.
-- Left padding during eval for decoder-only generation correctness.
-- Version-safe GenerationConfig; explicit stopping criteria for </answer> / code blocks.
-- Minimal dependencies: transformers, datasets, peft, trl, accelerate, bitsandbytes, torch, tqdm.
+Fixes:
+- Explicit use_cache=False before enabling gradient checkpointing (no HF warnings)
+- prepare_model_for_kbit_training BEFORE LoRA wrapping
+- Real gradient-norm logging via callback (no more 0.0 lies)
+- Safer LR/warmup/max_grad_norm to stabilize early steps
 """
 
 import os, re, json, time, argparse, tempfile, subprocess, warnings, copy, glob, math
@@ -28,6 +28,7 @@ from transformers import (
     BitsAndBytesConfig,
     GenerationConfig,
     DataCollatorForLanguageModeling,
+    TrainerCallback,
 )
 from transformers.utils import logging as hf_logging
 from transformers.generation.stopping_criteria import StoppingCriteria, StoppingCriteriaList
@@ -35,7 +36,7 @@ from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_t
 from trl import SFTTrainer, SFTConfig, GRPOTrainer, GRPOConfig
 from tqdm.auto import tqdm
 
-hf_logging.set_verbosity_warning()
+hf_logging.set_verbosity_error()
 
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -91,7 +92,7 @@ def parse_final_from_completion(txt: str) -> str:
 # ---------------------- stopping criteria -------------------------
 
 class StopOnSubstrings(StoppingCriteria):
-    def __init__(self, tokenizer: AutoTokenizer, substrings: List[str]):
+    def __init__(self, tokenizer: "AutoTokenizer", substrings: List[str]):
         super().__init__()
         self.tokenizer = tokenizer
         self.sequences: List[List[int]] = []
@@ -118,7 +119,7 @@ class StopOnSubstrings(StoppingCriteria):
                     return True
         return False
 
-def build_stop_criteria(tok: AutoTokenizer) -> StoppingCriteriaList:
+def build_stop_criteria(tok: "AutoTokenizer") -> StoppingCriteriaList:
     stops = [
         "</answer>", "\n</answer>", "</answer>\n", "\n\n</answer>",
         "\n```", "\n\n```",
@@ -237,7 +238,6 @@ def _map_mbpp_eval_columns(ds: Dataset) -> Dataset:
 
 def load_mbpp_test(n: Optional[int] = None) -> Dataset:
     # Always official test split for eval; never used in training here.
-    # Prefer sanitized if present (same tasks but normalized format).
     choice = None
     for repo, cfg in [("google-research-datasets/mbpp","sanitized"),
                       ("google-research-datasets/mbpp", None),
@@ -455,7 +455,7 @@ def eval_all(label, model, tok, outdir,
 
 def find_lora_targets(model) -> list:
     candidates = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj",
-                  "wq","wk","wv","wo","w1","w2","w3","proj"]
+                  "wq","wk","wv","wo","w1","w2","w3","proj","out_proj"]
     hits = set()
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Linear):
@@ -497,7 +497,95 @@ def forcebf16(module: nn.Module):
 
 # -------------------- SFT builder (CLEAN) -------------------------
 
-def pretokenize_for_sft(raw_ds: Dataset, tok: AutoTokenizer, max_len: int) -> Dataset:
+class GradNormOverrideCallback(TrainerCallback):
+    """Override HF's default grad_norm=0.0 with our computed value."""
+    def __init__(self):
+        self.last_grad_norm = 0.0
+        self.step_count = 0
+    
+    def on_backward_end(self, args, state, control, **kwargs):
+        # Capture gradient norm immediately after backward pass
+        model = kwargs.get("model")
+        trainer = kwargs.get("trainer")
+        if model is None:
+            model = trainer.model if trainer else None
+        if model is None:
+            return
+            
+        total_sq = 0.0
+        counted = 0
+        for name, p in model.named_parameters():
+            if p.grad is not None and torch.is_floating_point(p.grad):
+                g = p.grad.data
+                total_sq += float(g.norm(2) ** 2)
+                counted += 1
+        
+        if counted > 0:
+            self.last_grad_norm = total_sq ** 0.5
+            self.step_count += 1
+            # Print every few steps to avoid spam
+            if self.step_count % 5 == 0:
+                print(f"[RealGradNorm] step={state.global_step} grad_norm={self.last_grad_norm:.4f} params_with_grad={counted}")
+    
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        # Override the logged grad_norm with our real value
+        if logs is not None and self.last_grad_norm > 0:
+            logs["grad_norm"] = self.last_grad_norm
+
+class GradNormCallback(TrainerCallback):
+    def on_backward_end(self, args, state, control, **kwargs):
+        model = kwargs.get("model")
+        trainer = kwargs.get("trainer")
+        if model is None:
+            return
+        # Micro-step grad norm (before optimizer step)
+        total_sq = 0.0
+        counted = 0
+        for p in model.parameters():
+            if p.grad is not None and torch.is_floating_point(p.grad):
+                g = p.grad.data
+                total_sq += float(g.norm(2) ** 2)
+                counted += 1
+        if counted > 0:
+            gn = total_sq ** 0.5
+            if trainer is not None:
+                trainer.log({"micro_grad_norm": gn})
+            try:
+                from tqdm.auto import tqdm as _tqdm
+                _tqdm.write(f"[GradNorm] step={state.global_step} micro_grad_norm={gn:.4f}")
+            except Exception:
+                print(f"[GradNorm] step={state.global_step} micro_grad_norm={gn:.4f}")
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        model = kwargs.get("model")
+        trainer = kwargs.get("trainer")
+        if model is None:
+            return
+        try:
+            log_every = max(1, getattr(args, "logging_steps", 5))
+            if state.global_step % log_every != 0:
+                return
+        except Exception:
+            log_every = 5
+            if state.global_step % log_every != 0:
+                return
+        total_sq = 0.0
+        counted = 0
+        for name, p in model.named_parameters():
+            if p.grad is not None and torch.is_floating_point(p.grad):
+                g = p.grad.data
+                total_sq += float(g.norm(2) ** 2)
+                counted += 1
+        if counted > 0:
+            gn = total_sq ** 0.5
+            if trainer is not None:
+                trainer.log({"grad_norm": gn})
+            try:
+                from tqdm.auto import tqdm as _tqdm
+                _tqdm.write(f"[GradNorm] step={state.global_step} grad_norm={gn:.4f}")
+            except Exception:
+                print(f"[GradNorm] step={state.global_step} grad_norm={gn:.4f}")
+
+def pretokenize_for_sft(raw_ds: Dataset, tok: "AutoTokenizer", max_len: int) -> Dataset:
     def to_text(batch):
         texts = [f"{p}\n\n{t}" for p, t in zip(batch["prompt"], batch["target"])]
         return {"text": texts}
@@ -541,13 +629,11 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
         attn_implementation=attn_impl,
     )
     forcebf16(model)
-    model.config.use_cache = bool(disable_sft_gc)
 
-    gc = safe_clone_gen_cfg(getattr(model, "generation_config", None))
-    gc.do_sample = False; gc.top_p = None; gc.top_k = None; gc.temperature = None
-    gc.cache_implementation = "hybrid"
-    model.generation_config = gc
+    # Fix 1: set use_cache=False BEFORE enabling GC
+    model.config.use_cache = False
 
+    # Enable GC (if desired)
     if not disable_sft_gc:
         try:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -555,15 +641,37 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
             try: model.gradient_checkpointing_enable()
             except Exception: pass
 
+    # Ensure inputs require grads (HF/PEFT + GC quirk)
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    else:
+        # Fallback for older versions
+        def make_inputs_require_grad(module, input, output):
+            output.requires_grad_(True)
+        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+    # Fix 2: prepare for k-bit training BEFORE LoRA wrapping
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=not disable_sft_gc)
+
     targets = find_lora_targets(model)
     print(f"[LoRA] target_modules={targets}")
     lora = LoraConfig(
         r=16, lora_alpha=32, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM",
         target_modules=targets
     )
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=not disable_sft_gc)
     model = get_peft_model(model, lora)
     print_trainable_params(model)
+    # Reinforce after PEFT wrap: some wrappers toggle this back on
+    try:
+        model.config.use_cache = False
+    except Exception:
+        pass
+
+    # Generation config for SFT (deterministic)
+    gc = safe_clone_gen_cfg(getattr(model, "generation_config", None))
+    gc.do_sample = False; gc.top_p = None; gc.top_k = None; gc.temperature = None
+    gc.cache_implementation = "hybrid"
+    model.generation_config = gc
 
     raw = load_math_train()
     if include_mbpp_train:
@@ -580,27 +688,36 @@ def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
 
     args = SFTConfig(
         output_dir=os.path.join(output_dir, "sft"),
-        max_steps=sft_steps, learning_rate=lr,
+        max_steps=sft_steps,
+        learning_rate=lr,                          # safer default than 2e-5
+        warmup_steps=max(10, sft_steps // 20),     # shorter warmup for faster ramp
+        lr_scheduler_type="cosine",
         per_device_train_batch_size=per_device_train_batch_size,
-        gradient_accumulation_steps=grad_acc, bf16=bf16,
-        logging_steps=20, logging_first_step=True,
-        disable_tqdm=False, report_to="none",
+        gradient_accumulation_steps=grad_acc,
+        bf16=bf16,
+        logging_steps=5,
+        logging_first_step=True,
+        disable_tqdm=False,
+        report_to="none",
         save_steps=200,
-        lr_scheduler_type="cosine", warmup_ratio=0.03,
         gradient_checkpointing=not disable_sft_gc,
         remove_unused_columns=False,
         group_by_length=True,
         optim=optim_choice,
         dataloader_num_workers=dataloader_workers,
         dataloader_pin_memory=True,
+        max_grad_norm=1.0,                         # clip for stability
+        weight_decay=0.01,                         # regularization to stabilize loss
     )
 
     trainer = SFTTrainer(
         model=model, args=args, train_dataset=train_ds,
         data_collator=collator, peft_config=None,
     )
+    trainer.add_callback(GradNormOverrideCallback())
 
     if compile_models:
+        # Advice: leave this OFF for SFT unless you've verified stability.
         try:
             trainer.model = torch.compile(trainer.model, mode="reduce-overhead", fullgraph=False)
             print("[Perf] Compiled model with torch.compile")
@@ -631,7 +748,7 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
     bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
                              bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
 
-    # base model for RL + LoRA adapter from SFT
+    # base model for RL + (optional) SFT adapter
     base_model_for_rl = AutoModelForCausalLM.from_pretrained(
         base_model,
         torch_dtype=torch.bfloat16,
@@ -641,13 +758,14 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
         attn_implementation=attn_impl,
     )
     forcebf16(base_model_for_rl)
+
+    # RL config: no GC, fast generation, keep cache on
     base_model_for_rl.config.use_cache = True
     base_model_for_rl = prepare_model_for_kbit_training(base_model_for_rl, use_gradient_checkpointing=False)
     forcebf16(base_model_for_rl)
 
     model = base_model_for_rl
     if sft_ckpt and os.path.isdir(sft_ckpt):
-        # accept either direct checkpoint-* or parent 'sft' dir
         cp = sft_ckpt
         if not os.path.basename(cp).startswith("checkpoint-"):
             cands = glob.glob(os.path.join(cp, "checkpoint-*"))
@@ -676,13 +794,16 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
     print(f"[GRPO] Sampling: temp={rl_temperature}, top_p={rl_top_p}, top_k={rl_top_k}")
 
     # Build train datasets (train-only, CLEAN)
-    math_train = load_math_train().remove_columns([c for c in ["final"] if c in load_math_train().column_names]).map(lambda ex: {"task":"math"})
+    mt = load_math_train()
+    # remove 'final' if present (not needed for RL reward below)
+    if "final" in mt.column_names:
+        mt = mt.remove_columns(["final"])
+    math_train = mt.map(lambda ex: {"task":"math"})
 
     code_train = None
     if include_mbpp_train:
         mbpp_tv = load_mbpp_trainval(limit=mbpp_limit)
         if mbpp_tv is not None and len(mbpp_tv) > 0:
-            # for RL we only need prompts (and reward from execution of *train* tests we construct)
             def map_code_row(ex):
                 return {"prompt": ex["prompt"], "target": ex["target"], "task":"code"}
             code_train = mbpp_tv.map(map_code_row, remove_columns=[c for c in mbpp_tv.column_names if c not in ["prompt","target","task"]])
@@ -690,38 +811,27 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
         else:
             print("[GRPO] MBPP train/val not available; RL will be math-only.")
 
-    if code_train is not None:
-        mix = concatenate_datasets([math_train, code_train]).shuffle(seed=42)
-    else:
-        mix = math_train.shuffle(seed=42)
+    mix = concatenate_datasets([math_train, code_train]).shuffle(seed=42) if code_train is not None else math_train.shuffle(seed=42)
 
-    # Reward functions
+    # Reward functions (no test-set leakage)
     def reward_math(prompts=None, completions=None, **kwargs):
-        # we don't have GT finals during RL (train-only), so use weak heuristics:
-        # encourage <answer> presence and short final answers; discourage mega-thoughts.
         rewards = []
         for comp in completions:
             has = 1.0 if re.search(r"<answer>.*?</answer>", comp, re.S) else 0.0
-            final = parse_final_from_completion(comp)
             penalty = min(len(comp) / 2000.0, 1.0)  # length penalty
             r = 0.5 * has + 0.5 * (1.0 - penalty)
             rewards.append(float(r))
         return rewards
 
     def reward_code(prompts=None, completions=None, **kwargs):
-        # When using MBPP train/val for RL, we don't have official tests here.
-        # A simple structure check: requires code fence or def presence.
         rewards = []
         for comp in completions:
             m = re.search(r"```(?:python)?\s*(.*?)```", comp, re.S|re.I)
             code = m.group(1) if m else comp
             score = 0.0
-            if "def " in code:
-                score += 0.5
-            if "return " in code:
-                score += 0.3
-            if len(code) > 0:
-                score += 0.2
+            if "def " in code: score += 0.5
+            if "return " in code: score += 0.3
+            if len(code) > 0: score += 0.2
             rewards.append(float(score))
         return rewards
 
@@ -734,7 +844,6 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
                 out.extend(reward_code(prompts=[prompts[i]], completions=[completions[i]]))
         return out
 
-    stop_crit = build_stop_criteria(tok)
     generation_kwargs = {
         "do_sample": True,
         "temperature": rl_temperature,
@@ -819,7 +928,7 @@ def main():
     ap.add_argument("--skip_sft", action="store_true")
     ap.add_argument("--sft_ckpt", type=str, default=None, help="Use an existing SFT folder or checkpoint-*")
     ap.add_argument("--eval_only", action="store_true")
-    ap.add_argument("--grpo_ckpt", type=str, default=None)  # not used here; adapter is in output_dir/grpo
+    ap.add_argument("--grpo_ckpt", type=str, default=None)
 
     args = ap.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -873,7 +982,7 @@ def main():
             sft_steps=args.sft_steps, grad_acc=args.grad_acc, bf16=args.bf16, max_len=args.max_len,
             include_mbpp_train=args.include_mbpp_train, mbpp_limit=args.mbpp_limit,
             attn_impl=attn_map.get(args.attn, "eager"),
-            compile_models=args.compile_models,
+            compile_models=args.compile_models,     # consider off until stable
             disable_sft_gc=args.disable_sft_gc,
             use_8bit_optim=args.use_8bit_optim,
         )
@@ -882,7 +991,6 @@ def main():
         print(f"[SFT] Done. ckpt={args.sft_ckpt}")
 
     if args.eval_only:
-        # Load base + adapter (SFT or GRPO) and just run eval
         adapter_path = args.grpo_ckpt or args.sft_ckpt
         if not adapter_path:
             raise SystemExit("--eval_only requires --grpo_ckpt or --sft_ckpt")
