@@ -552,432 +552,6 @@ class GradNormRecorder:
             return (self.accum_sq ** 0.5)
         return self.last
 
-# -------------------- SFT builder (CLEAN) -------------------------
-
-class GradNormOverrideCallback(TrainerCallback):
-    """Override HF's default grad_norm=0.0 with our computed value."""
-    def __init__(self):
-        self.last_grad_norm = 0.0
-    
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        # Compute gradient norm at log time when we know trainer has run backward
-        if logs is None:
-            return
-
-        # Prefer the model passed in kwargs to avoid attribute access issues
-        model = kwargs.get("model")
-        if model is None:
-            trainer = kwargs.get("trainer")
-            model = getattr(trainer, "model", None) if trainer is not None else None
-        if model is None:
-            return
-            
-        # Try recorder first
-        rec: GradNormRecorder = getattr(model, "_grad_recorder", None)
-        if rec is not None:
-            gn = float(rec.peek())
-        else:
-            total_sq = 0.0
-            counted = 0
-            for name, p in model.named_parameters():
-                if p.grad is not None and torch.is_floating_point(p.grad):
-                    g = p.grad.data
-                    total_sq += float(g.norm(2) ** 2)
-                    counted += 1
-            gn = (total_sq ** 0.5) if counted > 0 else 0.0
-
-        if gn <= 0:
-            prev = getattr(model, "_last_grad_norm", None)
-            if prev is not None:
-                gn = float(prev)
-        if gn > 0:
-            self.last_grad_norm = gn
-            logs["grad_norm"] = self.last_grad_norm
-
-    def on_train_begin(self, args, state, control, **kwargs):
-        model = kwargs.get("model")
-        trainer = kwargs.get("trainer")
-        if model is None and trainer is not None:
-            model = getattr(trainer, "model", None)
-        if model is None:
-            return
-        # Attach recorder after model is fully prepared/wrapped by accelerate
-        if getattr(model, "_grad_recorder", None) is None:
-            try:
-                rec = GradNormRecorder()
-                rec.register(model)
-                # If nothing was hooked yet, try optimizer params too
-                if getattr(rec, 'hooked_params', 0) == 0 and trainer is not None:
-                    opt = getattr(trainer, 'optimizer', None)
-                    if opt is not None:
-                        rec.register_from_optimizer(opt)
-                setattr(model, "_grad_recorder", rec)
-                print(f"[Grad] Recorder hooks registered (on_train_begin). hooked_params={rec.hooked_params}")
-            except Exception as e:
-                print(f"[Grad] Recorder registration failed (on_train_begin): {e}")
-
-    def on_step_begin(self, args, state, control, **kwargs):
-        # Fallback: if recorder present but not hooked, try optimizer now
-        model = kwargs.get("model")
-        trainer = kwargs.get("trainer")
-        if model is None:
-            return
-        rec = getattr(model, "_grad_recorder", None)
-        if rec is not None and getattr(rec, 'hooked_params', 0) == 0 and trainer is not None:
-            try:
-                opt = getattr(trainer, 'optimizer', None)
-                if opt is not None:
-                    rec.register_from_optimizer(opt)
-                    print(f"[Grad] Recorder late-registered on optimizer params. hooked_params={rec.hooked_params}")
-            except Exception:
-                pass
-
-class GradNormCallback(TrainerCallback):
-    def on_before_optimizer_step(self, args, state, control, optimizer=None, **kwargs):
-        model = kwargs.get("model")
-        if model is None:
-            return
-        try:
-            max_gn = getattr(args, 'max_grad_norm', 1.0)
-            if isinstance(max_gn, (int, float)) and max_gn > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_gn)
-        except Exception:
-            pass
-    def on_step_end(self, args, state, control, **kwargs):
-        model = kwargs.get("model")
-        trainer = kwargs.get("trainer")
-        if model is None:
-            return
-        # Prefer recorder if available (captures grads before zeroing), snapshot at step end
-        rec: GradNormRecorder = getattr(model, "_grad_recorder", None)
-        if rec is not None:
-            gn = float(rec.pop())
-        else:
-            total_sq = 0.0
-            counted = 0
-            for p in model.parameters():
-                if p.grad is not None and torch.is_floating_point(p.grad):
-                    g = p.grad.data
-                    total_sq += float(g.norm(2) ** 2)
-                    counted += 1
-            gn = (total_sq ** 0.5) if counted > 0 else 0.0
-        # Optional: clip gradients to configured max_grad_norm for stability
-        # Clipping is now handled in on_before_optimizer_step
-
-        try:
-            setattr(model, "_last_grad_norm", float(gn))
-        except Exception:
-            pass
-
-        # One-time diagnostics at first step
-        try:
-            if int(state.global_step) == 1 and trainer is not None:
-                rec = getattr(model, "_grad_recorder", None)
-                opt = getattr(trainer, 'optimizer', None)
-                n_groups = len(opt.param_groups) if opt is not None else 0
-                trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                has_grad = sum(p.numel() for p in model.parameters() if getattr(p, 'grad', None) is not None)
-                # labels coverage (if batch still available via trainer)
-                label_cov = None
-                try:
-                    last_inputs = getattr(trainer, 'current_flos', None)  # placeholder; real inputs not available
-                except Exception:
-                    last_inputs = None
-                print(f"[Diag] step=1 hooked_params={getattr(rec,'hooked_params',0)} hook_calls={getattr(rec,'calls',0)} trainable={trainable} has_grad={has_grad} opt_groups={n_groups}")
-        except Exception:
-            pass
-        if trainer is not None:
-            # Only log on configured logging steps to avoid spam
-            try:
-                log_every = max(1, getattr(args, "logging_steps", 5))
-                first = bool(getattr(args, "logging_first_step", False))
-            except Exception:
-                log_every = 5
-                first = False
-            if state.global_step == 1 and first:
-                trainer.log({"micro_grad_norm": gn, "grad_norm": gn})
-            elif state.global_step % log_every == 0:
-                trainer.log({"micro_grad_norm": gn, "grad_norm": gn})
-        try:
-            from tqdm.auto import tqdm as _tqdm
-            rec = getattr(model, "_grad_recorder", None)
-            rc = getattr(rec, 'calls', 0) if rec is not None else 0
-            hp = getattr(rec, 'hooked_params', 0) if rec is not None else 0
-            _tqdm.write(f"[GradNorm] step={state.global_step} micro_grad_norm={gn:.4f} (hook_calls={rc} hooked_params={hp})")
-        except Exception:
-            print(f"[GradNorm] step={state.global_step} micro_grad_norm={gn:.4f}")
-
-def pretokenize_for_sft(raw_ds: Dataset, tok: "AutoTokenizer", max_len: int) -> Dataset:
-    tok.model_max_length = max_len
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    tok.padding_side = "right"
-
-    use_chat = hasattr(tok, "apply_chat_template")
-
-    def encode_example_chat(ex):
-        p = ex["prompt"]; t = ex["target"]
-        msgs_p = [{"role":"user","content": p}]
-        msgs_full = [{"role":"user","content": p}, {"role":"assistant","content": t}]
-
-        enc_p = tok.apply_chat_template(msgs_p, add_generation_prompt=True, tokenize=True)
-        enc_f = tok.apply_chat_template(msgs_full, add_generation_prompt=False, tokenize=True)
-        p_ids = enc_p["input_ids"] if isinstance(enc_p, dict) else enc_p
-        f_ids = enc_f["input_ids"] if isinstance(enc_f, dict) else enc_f
-        # Flatten if nested (single example sometimes returns [ids])
-        if isinstance(p_ids, list) and len(p_ids) > 0 and isinstance(p_ids[0], list):
-            p_ids = p_ids[0]
-        if isinstance(f_ids, list) and len(f_ids) > 0 and isinstance(f_ids[0], list):
-            f_ids = f_ids[0]
-        # Find robust prompt boundary via longest common prefix
-        lcp = 0
-        for a, b in zip(p_ids, f_ids):
-            if a == b:
-                lcp += 1
-            else:
-                break
-
-        # Truncate from the left to fit max_len, preferring to keep target
-        if len(f_ids) > max_len:
-            # number to drop
-            drop = len(f_ids) - max_len
-            f_ids = f_ids[drop:]
-            # Prompt kept length adjusts accordingly
-            kept_p = max(0, lcp - drop)
-        else:
-            kept_p = lcp
-        # After truncation, labels are -100 for kept prompt tokens, then actual ids for the rest
-        input_ids = f_ids
-        labels = ([-100] * kept_p) + f_ids[kept_p:]
-        attention_mask = [1] * len(input_ids)
-        return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
-
-    def encode_example_basic(ex):
-        p = ex["prompt"]; t = ex["target"]
-        p_ids = tok(p, add_special_tokens=False)["input_ids"]
-        t_ids = tok(t, add_special_tokens=False)["input_ids"]
-        eos = [tok.eos_token_id] if tok.eos_token_id is not None else []
-        max_target = max_len - len(eos)
-        if len(t_ids) > max_target:
-            t_ids = t_ids[:max_target]
-        remain = max_len - len(t_ids) - len(eos)
-        if remain < 0:
-            remain = 0
-        if len(p_ids) > remain:
-            p_ids = p_ids[-remain:] if remain > 0 else []
-        input_ids = p_ids + t_ids + eos
-        labels = ([-100] * len(p_ids)) + t_ids + eos
-        attention_mask = [1] * len(input_ids)
-        return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
-
-    mapper = encode_example_chat if use_chat else encode_example_basic
-    ds_tok = raw_ds.map(mapper, remove_columns=list(raw_ds.column_names))
-    ds_tok.set_format(type="torch")
-    return ds_tok
-
-class DataCollatorKeepLabels:
-    def __init__(self, tokenizer: AutoTokenizer, label_pad_token_id: int = -100):
-        self.tok = tokenizer
-        self.label_pad_token_id = label_pad_token_id
-
-    def __call__(self, features: List[dict]) -> dict:
-        # Ensure lists for pad()
-        def tolist(x):
-            if isinstance(x, torch.Tensor):
-                return x.tolist()
-            return x
-        batch_inputs = {
-            "input_ids": [tolist(f["input_ids"]) for f in features],
-            "attention_mask": [tolist(f["attention_mask"]) for f in features],
-        }
-        batch = self.tok.pad(batch_inputs, padding=True, return_tensors="pt")
-        max_len = batch["input_ids"].size(1)
-        labels = torch.full((len(features), max_len), self.label_pad_token_id, dtype=torch.long)
-        for i, f in enumerate(features):
-            li = tolist(f["labels"]) if "labels" in f else tolist(f["input_ids"])  # fallback
-            L = min(len(li), max_len)
-            labels[i, :L] = torch.tensor(li[:L], dtype=torch.long)
-        batch["labels"] = labels
-        return batch
-
-def sft_dataset_sanity(ds: Dataset, tok: "AutoTokenizer", sample_n: int = 256):
-    try:
-        n = min(sample_n, len(ds))
-        sup_lens = []
-        bad_range = 0
-        voc = tok.vocab_size if hasattr(tok, 'vocab_size') else None
-        zero_sup = 0
-        for i in range(n):
-            ex = ds[i]
-            labels = ex["labels"].tolist() if isinstance(ex["labels"], torch.Tensor) else ex["labels"]
-            L = len(labels)
-            s = sum(1 for v in labels if v != -100)
-            sup_lens.append(s)
-            if s == 0:
-                zero_sup += 1
-            if voc is not None:
-                for v in labels:
-                    if v != -100 and (v < 0 or v >= voc):
-                        bad_range += 1
-                        break
-        if sup_lens:
-            import statistics as st
-            avg = st.mean(sup_lens)
-            p50 = st.median(sup_lens)
-            p90 = sorted(sup_lens)[int(0.9*len(sup_lens))-1]
-            print(f"[SFT Sanity] n={n} avg_supervised_tokens={avg:.1f} p50={p50} p90={p90} zero_supervised={zero_sup}")
-            if tok and hasattr(tok, 'vocab_size'):
-                print(f"[SFT Sanity] tokenizer.vocab_size={tok.vocab_size} bad_label_range_examples={bad_range}")
-    except Exception as e:
-        print(f"[SFT Sanity] Skipped sanity check: {e}")
-
-def build_sft_trainer(base_model, output_dir, sft_steps=300, lr=2e-5,
-                      per_device_train_batch_size=1, grad_acc=8, bf16=True, max_len=4096,
-                      include_mbpp_train: bool = False, mbpp_limit: Optional[int] = None,
-                      attn_impl: str = "eager",
-                      compile_models: bool = False,
-                      disable_sft_gc: bool = False,
-                      use_8bit_optim: bool = False,
-                      dataloader_workers: int = 4):
-    tok = AutoTokenizer.from_pretrained(base_model, use_fast=True, trust_remote_code=True)
-    if tok.pad_token is None: tok.pad_token = tok.eos_token
-    tok.padding_side = "right"
-    tok.model_max_length = max_len
-
-    bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
-                             bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model,
-        torch_dtype=torch.bfloat16,
-        quantization_config=bnb,
-        device_map="auto",
-        trust_remote_code=True,
-        attn_implementation=attn_impl,
-    )
-    forcebf16(model)
-
-    # Fix 1: set use_cache=False BEFORE enabling GC
-    model.config.use_cache = False
-
-    # Enable GC (if desired)
-    if not disable_sft_gc:
-        try:
-            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        except Exception:
-            try: model.gradient_checkpointing_enable()
-            except Exception: pass
-
-    # Ensure inputs require grads (HF/PEFT + GC quirk)
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
-    else:
-        # Fallback for older versions
-        def make_inputs_require_grad(module, input, output):
-            output.requires_grad_(True)
-        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-
-    # Fix 2: prepare for k-bit training BEFORE LoRA; let TRL inject LoRA via peft_config
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=not disable_sft_gc)
-
-    targets = find_lora_targets(model)
-    print(f"[LoRA] target_modules={targets}")
-    lora = LoraConfig(
-        r=8, lora_alpha=16, lora_dropout=0.10, bias="none", task_type="CAUSAL_LM",
-        target_modules=targets
-    )
-    # Do NOT wrap here; pass peft_config to SFTTrainer to ensure optimizer picks LoRA params
-    try:
-        model.config.use_cache = False
-    except Exception:
-        pass
-
-    # Generation config for SFT (deterministic)
-    gc = safe_clone_gen_cfg(getattr(model, "generation_config", None))
-    gc.do_sample = False; gc.top_p = None; gc.top_k = None; gc.temperature = None
-    gc.cache_implementation = "hybrid"
-    model.generation_config = gc
-
-    raw = load_math_train()
-    if include_mbpp_train:
-        mbpp_ds = load_mbpp_trainval(limit=mbpp_limit)
-        if mbpp_ds is not None and len(mbpp_ds) > 0:
-            raw = concatenate_datasets([raw, mbpp_ds])
-            print(f"[SFT] Added MBPP train/val examples: {len(mbpp_ds):,}")
-        else:
-            print("[SFT] MBPP train/val not available; continuing without it.")
-
-    train_ds = pretokenize_for_sft(raw, tok, max_len=max_len)
-    # Use a collator that preserves provided masked labels
-    collator = DataCollatorKeepLabels(tok, label_pad_token_id=-100)
-    optim_choice = "paged_adamw_8bit" if use_8bit_optim else "adamw_torch"
-
-    args = SFTConfig(
-        output_dir=os.path.join(output_dir, "sft"),
-        max_steps=sft_steps,
-        learning_rate=min(lr, 2.0e-6),             # even tighter LR cap for stability
-        warmup_steps=max(100, int(0.20 * sft_steps)),  # 20% warmup or at least 100 steps
-        warmup_ratio=0.0,                          # disable ratio-based warmup
-        lr_scheduler_type="cosine",
-        per_device_train_batch_size=per_device_train_batch_size,
-        gradient_accumulation_steps=grad_acc,
-        bf16=bf16,
-        logging_steps=5,
-        logging_first_step=True,
-        disable_tqdm=False,
-        report_to="none",
-        save_steps=200,
-        gradient_checkpointing=not disable_sft_gc,
-        remove_unused_columns=False,
-        group_by_length=True,
-        optim=optim_choice,
-        dataloader_num_workers=dataloader_workers,
-        dataloader_pin_memory=True,
-        max_grad_norm=0.1,                         # very tight clip for early stability
-        weight_decay=0.0,                          # disable weight decay for LoRA
-        adam_beta1=0.9,
-        adam_beta2=0.95,
-    )
-
-    trainer = SFTTrainer(
-        model=model, args=args, train_dataset=train_ds,
-        data_collator=collator, peft_config=lora,
-    )
-    
-    # Debug: print optimizer param groups and initial learning rates
-    def print_optimizer_lr(trainer):
-        opt = getattr(trainer, 'optimizer', None)
-        if opt is not None:
-            for i, group in enumerate(opt.param_groups):
-                print(f"[DEBUG] Optimizer group {i} lr={group['lr']}")
-    print_optimizer_lr(trainer)
-    try:
-        print_trainable_params(trainer.model)
-    except Exception:
-        pass
-
-    # Recorder hooks will be attached on on_train_begin after Accelerate wraps the model
-
-    # Force initial LR to be nonzero for all param groups
-    opt = getattr(trainer, 'optimizer', None)
-    if opt is not None:
-        for group in opt.param_groups:
-            if group['lr'] == 0.0:
-                group['lr'] = args.learning_rate if hasattr(args, 'learning_rate') else 2e-5
-                print(f"[FIX] Set optimizer group lr to {group['lr']}")
-    
-    trainer.add_callback(GradNormOverrideCallback())
-    trainer.add_callback(GradNormCallback())
-    
-    if compile_models:
-        # Advice: leave this OFF for SFT unless you've verified stability.
-        try:
-            trainer.model = torch.compile(trainer.model, mode="reduce-overhead", fullgraph=False)
-            print("[Perf] Compiled model with torch.compile")
-        except Exception as e:
-            print(f"[Perf] torch.compile skipped: {e}")
-
-    return trainer, tok
-
 # -------------------- GRPO builder (CLEAN) ------------------------
 
 def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
@@ -1026,7 +600,16 @@ def build_grpo_trainer(base_model, sft_ckpt, output_dir, rl_steps=300,
         print(f"[GRPO] Loading SFT adapter from: {cp}")
         model = PeftModel.from_pretrained(base_model_for_rl, cp, is_trainable=True)
     else:
-        print("[GRPO] No SFT adapter provided; RL will start from base model LoRA-free (trainable heads only).")
+        print("[GRPO] No SFT adapter provided; creating new LoRA for RL.")
+        lora_config = LoraConfig(
+            r=8,
+            lora_alpha=16,
+            lora_dropout=0.1,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=find_lora_targets(base_model_for_rl),
+        )
+        model = get_peft_model(base_model_for_rl, lora_config)
 
     forcebf16(model)
     model.train()
@@ -1146,7 +729,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base_model", type=str, default="google/gemma-3-4b-it")
     ap.add_argument("--output_dir", type=str, default="./runs/gemma3-clean")
-    ap.add_argument("--sft_steps", type=int, default=300)
     ap.add_argument("--rl_steps", type=int, default=300)
     ap.add_argument("--per_device_train_batch_size", type=int, default=1)
     ap.add_argument("--grad_acc", type=int, default=8)
@@ -1155,13 +737,12 @@ def main():
     ap.add_argument("--bf16", action="store_true"); ap.add_argument("--no_bf16", dest="bf16", action="store_false"); ap.set_defaults(bf16=True)
 
     # Train data toggles (CLEAN defaults)
-    ap.add_argument("--include_mbpp_train", action="store_true", help="Use MBPP train/val in SFT and RL (never test).")
+    ap.add_argument("--include_mbpp_train", action="store_true", help="Use MBPP train/val in RL (never test).")
     ap.add_argument("--mbpp_limit", type=int, default=None)
 
     # Attention / perf
     ap.add_argument("--attn", type=str, choices=["eager","sdpa","flash"], default="eager")
     ap.add_argument("--compile_models", action="store_true")
-    ap.add_argument("--disable_sft_gc", action="store_true")
     ap.add_argument("--use_8bit_optim", action="store_true")
 
     # Eval sampling & batching
@@ -1177,8 +758,6 @@ def main():
 
     # Flow control
     ap.add_argument("--skip_baseline_eval", action="store_true")
-    ap.add_argument("--skip_sft", action="store_true")
-    ap.add_argument("--sft_ckpt", type=str, default=None, help="Use an existing SFT folder or checkpoint-*")
     ap.add_argument("--eval_only", action="store_true")
     ap.add_argument("--grpo_ckpt", type=str, default=None)
 
@@ -1226,26 +805,10 @@ def main():
     else:
         print("[Baseline] Skipped baseline evaluation.")
 
-    if args.skip_sft and not args.sft_ckpt:
-        print("[Main] SFT skipped without a checkpoint; RL will start from base model.")
-    elif not args.skip_sft:
-        sft_trainer, tok_sft = build_sft_trainer(
-            base_model=args.base_model, output_dir=args.output_dir,
-            sft_steps=args.sft_steps, grad_acc=args.grad_acc, bf16=args.bf16, max_len=args.max_len,
-            include_mbpp_train=args.include_mbpp_train, mbpp_limit=args.mbpp_limit,
-            attn_impl=attn_map.get(args.attn, "eager"),
-            compile_models=args.compile_models,     # consider off until stable
-            disable_sft_gc=args.disable_sft_gc,
-            use_8bit_optim=args.use_8bit_optim,
-        )
-        sft_trainer.train()
-        args.sft_ckpt = sft_trainer.args.output_dir
-        print(f"[SFT] Done. ckpt={args.sft_ckpt}")
-
     if args.eval_only:
-        adapter_path = args.grpo_ckpt or args.sft_ckpt
+        adapter_path = args.grpo_ckpt
         if not adapter_path:
-            raise SystemExit("--eval_only requires --grpo_ckpt or --sft_ckpt")
+            raise SystemExit("--eval_only requires --grpo_ckpt")
         print(f"[EvalOnly] Loading adapter from: {adapter_path}")
 
         tok_eval = AutoTokenizer.from_pretrained(args.base_model, use_fast=True, trust_remote_code=True)
@@ -1289,7 +852,7 @@ def main():
 
     # GRPO (clean)
     grpo_trainer, tok_rl = build_grpo_trainer(
-        base_model=args.base_model, sft_ckpt=args.sft_ckpt, output_dir=args.output_dir,
+        base_model=args.base_model, sft_ckpt=None, output_dir=args.output_dir,
         rl_steps=args.rl_steps, per_device_train_batch_size=args.per_device_train_batch_size,
         grad_acc=max(1, args.grad_acc//2), group_size=args.group_size, bf16=args.bf16, max_len=args.max_len,
         include_mbpp_train=args.include_mbpp_train, mbpp_limit=args.mbpp_limit,
@@ -1317,7 +880,7 @@ def main():
     print("[Trained]", json.dumps(trained, indent=2))
 
     print(f"Saved metrics to:\n  {os.path.join(args.output_dir,'metrics_baseline.json') if not args.skip_baseline_eval else '(baseline skipped)'}\n  {os.path.join(args.output_dir,'metrics_trained.json')}")
-    print(f"SFT ckpt:  {args.sft_ckpt}\nGRPO ckpt: {grpo_trainer.args.output_dir}")
+    print(f"GRPO ckpt: {grpo_trainer.args.output_dir}")
 
 if __name__ == "__main__":
     main()

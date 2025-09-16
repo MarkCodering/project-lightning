@@ -59,6 +59,8 @@ COMMON_ARGS=(
   --output_dir "$OUTDIR"
   --sft_steps "$SFT_STEPS"
   --rl_steps "$RL_STEPS"
+  --sft_lr_scheduler_type "cosine"
+  --sft_warmup_ratio 0.1
   --grad_acc 24
   --max_len 1536
   --attn "$ATTN_IMPL"
@@ -72,6 +74,7 @@ COMMON_ARGS=(
   --eval_gsm8k_tasks "$EVAL_GSM_TASKS"
   --use_8bit_optim
   --skip_baseline_eval
+  --skip_sft
 )
 
 # Optional toggles
@@ -98,7 +101,7 @@ if [[ "$MODE" == "eval-only" ]]; then
     ${GRPO_CKPT:+--grpo_ckpt "$GRPO_CKPT"}
 
 else
-  echo "[RUN] TRAIN (SFT -> GRPO) + POST-TRAIN EVALS"
+  echo "[RUN] TRAIN (GRPO) + POST-TRAIN EVALS"
   # keep compile OFF for SFT for stability; if COMPILE_MODELS=true it's passed and the script will try it
   python train_quantum_reasoner.py \
     "${COMMON_ARGS[@]}" \
