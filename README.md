@@ -2,6 +2,37 @@
 
 Reasoning SFT → GRPO training for Gemma 3 family with built-in benchmarks (GSM8K, MBPP, HumanEval) and optional quantum reward shaping.
 
+## Installation
+
+Recommended order:
+
+1) Create and activate a Python 3.10–3.12 virtualenv.
+2) Install a matching PyTorch build for your CUDA/CPU:
+
+```bash
+# Example: CUDA 12.1
+pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
+
+# Or CPU-only
+pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
+```
+
+3) Install the rest of the requirements:
+
+```bash
+pip install -r requirements.txt
+```
+
+Optional (GPU only): FlashAttention. This is not required to run the training script and is intentionally not pinned in `requirements.txt` because it depends on your CUDA and compiler toolchain. If you want it:
+
+```bash
+# Try prebuilt wheels first
+pip install flash-attn --no-build-isolation
+
+# If that fails, consult the project docs for a source build compatible
+# with your CUDA + PyTorch versions.
+```
+
 ## Datasets
 
 - Math SFT: GSM8K + Hendrycks MATH (selected configs). Always included.

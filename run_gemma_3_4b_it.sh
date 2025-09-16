@@ -70,7 +70,6 @@ COMMON_ARGS=(
   --eval_humaneval_tasks "$EVAL_HE_TASKS"
   --eval_gsm8k_tasks "$EVAL_GSM_TASKS"
   --use_8bit_optim
-  --skip_baseline_eval
 )
 
 # Optional toggles

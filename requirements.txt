@@ -22,4 +22,6 @@ sentence-transformers>=2.2.2
 numpy>=1.24.0
 scipy>=1.10.0
 
-flash-attn
+# Optional: FlashAttention is GPU/architecture specific and often
+# requires a matching PyTorch/CUDA toolchain. Install manually if needed:
+#   pip install flash-attn --no-build-isolation
