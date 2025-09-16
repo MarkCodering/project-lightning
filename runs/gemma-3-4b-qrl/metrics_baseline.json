@@ -1,0 +1,6 @@
+{
+  "label": "baseline",
+  "gsm8k_acc": 0.56,
+  "mbpp_pass1": 0.06,
+  "humaneval_pass1": 0.4666666666666667
+}

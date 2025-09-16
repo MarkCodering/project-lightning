@@ -1,0 +1,6 @@
+{
+  "label": "trained",
+  "gsm8k_acc": 0.14,
+  "mbpp_pass1": 0.02,
+  "humaneval_pass1": 0.6
+}
